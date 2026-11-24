@@ -1,6 +1,4 @@
-# Dependabot keeps dependencies patched and, together with SHA-pinned
-# GitHub Actions, addresses the OpenSSF Scorecard "Pinned-Dependencies"
-# and "Vulnerabilities" checks. See:
+# Automated dependency updates for Python packages and GitHub Actions.
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates
 version: 2
 updates:
