@@ -107,6 +107,4 @@ While you can collect hardware traces, we do not recommend doing so during profi
 
 Performing this profiling results in generating a `*.pt.trace.json.gz` file that can be opened using [Perfetto](https://perfetto.habana.ai).
 
-![](../../assets/profiling/asynchronous_server_profiling.png)
-
 The file shows profiling of multiple prompts and decodes, where decode operations are measured, and host-side gaps between them can also be observed for analysis.

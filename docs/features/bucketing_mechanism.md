@@ -72,8 +72,6 @@ The following example presents a possible distribution:
 min = 128, step = 128, max = 4096, limit = 13
 ```
 
-![exponential bucketing distribution for 4096 max query length](../assets/graphs/exponential_bucketing_example.png)
-
 This strategy creates more buckets with smaller values closer to `min`. As the values increase toward `max`, the buckets become less frequent, meaning the distance between them increases. This helps prioritize warming up the smaller values more precisely, while still covering the full range.
 
 ### Linear Strategy

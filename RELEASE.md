@@ -11,8 +11,7 @@ The project's versioning and branching model follows these rules:
   `vX.Y.Z` is built on and compatible with the corresponding upstream `vllm`
   `vX.Y.Z` release.
 - Each release line lives on a `releases/vX.Y.Z` branch cut from `main`.
-  Fixes for a release are backported to that branch via PRs targeting it,
-  as described in [`AGENTS.md`](AGENTS.md).
+  Fixes for a release are backported to that branch via PRs targeting it.
 - Releases are tagged `vX.Y.Z`. Pre-releases use an `rcN` suffix,
   such as `v0.24.0rc0`, and post-releases use a `.postN` suffix, such as
   `v0.19.1.post1`.

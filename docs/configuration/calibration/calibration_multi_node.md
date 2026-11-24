@@ -100,10 +100,6 @@ For models with Mixture of Experts (MoE), such as [DeepSeek-R1](https://huggingf
 2. Optionally, postprocessing the unified measurements to improve performance.
 3. Expanding the unified results to the desired number of expert-parallel cards. The `step-6-expand-measurements` script distributes the expert measurements across the target number of cards, while other values are reused.
 
-The following diagram presents an example in which calibration is performed on 2 cards and deployment occurs on 4 cards.
-
-![](../../assets/calibration/unify-and-expand.png)
-
 The following example demonstrates calibration with DeepSeek-R1 on 8 cards, followed by deployment on 16 and 32 cards.
 
 ```bash

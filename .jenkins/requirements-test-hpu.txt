@@ -1,4 +1,0 @@
-lm_eval
-pytest
-pytest_asyncio
-hf_transfer

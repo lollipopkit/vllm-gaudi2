@@ -160,6 +160,4 @@ To execute E2E profiling, use one of the following procedures.
 
 Performing E2E profiling results in generating a `vllm(...).pt.trace.json.gz` file that can be opened using [Perfetto](https://perfetto.habana.ai).
 
-![](../../assets/profiling/e2e_profiling.png)
-
 This file provides information about host gaps, prompt and decode durations, recompilation events, and python execution times.

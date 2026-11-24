@@ -37,9 +37,7 @@ To execute the profiling, follow these steps:
       --max-model-len 256
     ```
 
-This profiling mode ends with an intentional assertion after collecting the requested trace. This is expected behavior, and the profiling data is successfully collected. As a result, a `*.pt.trace.json.gz` file is generated and saved in the current working directory. It can be viewed using [Perfetto](https://perfetto.habana.ai):
-
-![](../../assets/profiling/limited_device_information_profiling.png)
+This profiling mode ends with an intentional assertion after collecting the requested trace. This is expected behavior, and the profiling data is successfully collected. As a result, a `*.pt.trace.json.gz` file is generated and saved in the current working directory. It can be viewed using [Perfetto](https://perfetto.habana.ai).
 
 ## Enhancing Profiler Configuration
 
@@ -71,9 +69,6 @@ To gain more detailed insights into device-level behavior, such as fused graph s
       --max-model-len 256
     ```
 
-As a result, the `.hltv` file is generated in the current directory in addition to the `*.pt.trace.json.gz` file:
-
-![](../../assets/profiling/detailed_device_information_profiling.png)
-![](../../assets/profiling/detailed_device_information_profiling_2.png)
+As a result, the `.hltv` file is generated in the current directory in addition to the `*.pt.trace.json.gz` file.
 
 The `.hltv` file contains node names, graph structures, and information on what is inside each fused op.
