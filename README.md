@@ -10,9 +10,23 @@ Targets **Gaudi2 only** (not tested on Gaudi1 or Gaudi3). The Python package nam
 
 | Model | Precision | Performance | Quality / Key Optimizations |
 |---|---|---|---|
-| **Inkling 2 Mini** (26.4B Looped MoE + 23-layer ViT) | FP8 (`inkling2_fp8`) | `133.1 tok/s` (`7.51 ms`, `c=1`) · `316.1` (`c=4`) · `488.2` (`c=8`) · `431.2` (`c=8` diverse) | `25.55 GiB` HBM, 17 custom TPC-C kernels, 6-layer decode groups, native FP8→FP32 `lm_head` |
-| **Qwen3.8-27B** (48 GDN + 16 GQA) | FP8 + FP8 KV | `62.9–63.7 tok/s` (`15.7–15.9 ms`, `b=1`, +90% vs upstream) · `240–242` out / `2,211–2,248` total (`c=8`) | GSM8K `95.3%`, NLL `+0.0012` vs BF16, custom GDN TPC kernels, FlashQLA prefill, MTP / DFlash2 |
+| **Inkling 2 Mini** (26.4B Looped MoE + 23-layer ViT) | FP8 (`inkling2_fp8`) | `133.1 tok/s` (`7.51 ms`, `c=1`) · `316.1` (`c=4`) · `488.2` (`c=8`) · `431.2` (`c=8` diverse) | `25.55 GiB` HBM, 17 custom TPC-C kernels (`2.87×` at `c=1`, `2.65×` at `c=8` vs. stock TPC), 6-layer decode groups, native FP8→FP32 `lm_head` |
+| **Qwen3.8-27B** (48 GDN + 16 GQA) | FP8 + FP8 KV | `62.9–63.7 tok/s` (`15.7–15.9 ms`, `b=1`) · `240–245` out / `2,211–2,248` total (`c=8`) · `322.7` out / `2,970` total (`c=32`) | GSM8K `95.3%`, NLL `+0.0012` vs BF16, custom GDN TPC kernels, FlashQLA prefill, MTP / DFlash2 |
 | **LiquidAI LFM3** (`1.7B` / `VL-2B` / `Omni-2B`) | FP8 (`e4m3fn`) | `180.5 tok/s` (`b=1`) · `1,257` (`b=8`) · `1,380` out / `12,478` total (`c=32`, vendor sampling) | GSM8K `76.7%`, MMStar `74.4%`, LibriSpeech WER `2.62%`, `HPUShortConv`, packed vision tower |
+
+### Comparison vs. Upstream `vllm-project/vllm-gaudi`
+
+Measured on the same single `HL-225` (`350 W` cap) with `vllm bench serve` (`2048` input / `256` output tokens) on **Qwen3.8-27B-FP8**:
+
+| Metric | Upstream `vllm-gaudi` | `vllm-gaudi2` | Speedup |
+|---|---:|---:|---:|
+| `c=1` decode speed (`1 / TPOT`) | `33.5 tok/s` (`29.84 ms`) | `62.9–63.7 tok/s` (`15.7–15.9 ms`) | **1.88–1.90×** |
+| `c=1` serve output throughput | `31.19 tok/s` | `57.7 tok/s` | **1.85×** |
+| `c=8` serve output / total throughput | `113.8` / `1,048 tok/s` (`58.48 ms` TPOT) | `240–245` / `2,211–2,248 tok/s` (`24.8–25.5 ms` TPOT) | **2.11–2.15×** |
+| `c=32` serve output / total throughput | `145.0` / `1,335 tok/s` (`166.4 ms` TPOT) | `322.7` / `2,970 tok/s` | **2.22×** |
+| **Inkling 2 Mini** / **LiquidAI LFM3** | Not supported | Supported (FP8 + custom TPC / HPU backends) | — |
+
+> The upstream `vllm-gaudi` baseline was recorded on the same hardware prior to the PyTorch 2.13 / `v0.34.0` upgrade (PyTorch 2.9, default prefix caching enabled); `vllm-gaudi2` runs with `--no-enable-prefix-caching` and `--kv-cache-dtype fp8_inc` as shown in Quick Start.
 
 ## Key Features
 
