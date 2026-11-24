@@ -53,7 +53,6 @@ def _find_op_library() -> str | None:
             candidates.append(
                 str(resolved.parents[depth] / "tpc" / "torch" / "inkling2_tpc*.so")
             )
-    candidates.append("/opt/gaudi2/tpc/torch/inkling2_tpc*.so")
     for pattern in candidates:
         matches = sorted(glob.glob(pattern))
         if matches:

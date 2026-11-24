@@ -34,7 +34,7 @@ VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e .
 cd ..
 
 # 2. This plugin
-git clone git@github.com:lollipopkit/vllm-gaudi2.git
+git clone https://github.com/lollipopkit/vllm-gaudi2.git
 cd vllm-gaudi2
 pip install --no-build-isolation -e .
 

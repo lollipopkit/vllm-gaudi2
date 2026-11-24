@@ -29,7 +29,7 @@ requires-python = ">=3.9,<3.13"
 dynamic = [ "version", "dependencies", "optional-dependencies"]
 
 [project.urls]
-Homepage = "https://github.com/vllm-project/vllm-gaudi"
+Homepage = "https://github.com/lollipopkit/vllm-gaudi2"
 
 
 [tool.setuptools_scm]
