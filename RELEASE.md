@@ -35,24 +35,24 @@ Each release includes these assets:
 
 | Asset | Description |
 | :--- | :--- |
-| `vllm-gaudi-<tag>.tar.gz` | Source tarball for the tag |
-| `vllm-gaudi-<tag>.tar.gz.sha256` | SHA-256 checksum of the tarball |
-| `vllm-gaudi-<tag>.tar.gz.sig` | Cosign signature |
-| `vllm-gaudi-<tag>.tar.gz.pem` | Fulcio signing certificate |
+| `vllm-gaudi2-<tag>.tar.gz` | Source tarball for the tag |
+| `vllm-gaudi2-<tag>.tar.gz.sha256` | SHA-256 checksum of the tarball |
+| `vllm-gaudi2-<tag>.tar.gz.sig` | Cosign signature |
+| `vllm-gaudi2-<tag>.tar.gz.pem` | Fulcio signing certificate |
 
 > Note: GitHub also auto-generates its own `Source code (tar.gz/zip)` links on
-> every release. Prefer the signed `vllm-gaudi-<tag>.tar.gz` asset above when
+> every release. Prefer the signed `vllm-gaudi2-<tag>.tar.gz` asset above when
 > integrity matters, as only that artifact is covered by the signature.
 
 ## Verifying a signed release
 
 Install [Cosign](https://docs.sigstore.dev/system_config/installation/), then
-run the following commands for a tag such as `v0.24.0`:
+run the following commands for a tag such as `v0.34.0`:
 
 ```bash
-TAG=v0.24.0
-BASE="https://github.com/vllm-project/vllm-gaudi/releases/download/${TAG}"
-ART="vllm-gaudi-${TAG}.tar.gz"
+TAG=v0.34.0
+BASE="https://github.com/lollipopkit/vllm-gaudi2/releases/download/${TAG}"
+ART="vllm-gaudi2-${TAG}.tar.gz"
 
 # Download the tarball, signature, and certificate.
 curl -sSLO "${BASE}/${ART}"
