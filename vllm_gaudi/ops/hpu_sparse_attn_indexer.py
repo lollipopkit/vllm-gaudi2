@@ -3,6 +3,8 @@
 import torch
 from vllm.forward_context import get_forward_context
 
+from vllm_gaudi.extension.utils import index_copy_indices
+
 
 def _fill_invalid(buf, n):
     """Fill topk_indices_buffer rows 0..n-1 with the upstream -1 sentinel.
@@ -28,7 +30,7 @@ def forward_hpu(self, hidden_states, q, k, weights):
         return self.topk_indices_buffer
 
     if not self.skip_k_cache_insert:
-        kv_cache.index_copy_(0, slot_mapping[:k.shape[0]], k)
+        kv_cache.index_copy_(0, index_copy_indices(slot_mapping[:k.shape[0]]), k)
 
     if attn_metadata.is_prompt:
         _fill_invalid(self.topk_indices_buffer, q.shape[0])

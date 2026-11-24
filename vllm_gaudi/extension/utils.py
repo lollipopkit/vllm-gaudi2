@@ -60,6 +60,22 @@ def get_kv_fetch_extra_args(**kwargs):
     return kwargs
 
 
+def index_copy_indices(indices: torch.Tensor) -> torch.Tensor:
+    """Return indices with a dtype accepted by Tensor.index_copy_.
+
+    Compiled HPU graphs and Habana lazy mode accept int32 directly (avoiding a
+    per-write cast_i64_to_i32 node); PyTorch eager mode (CPU and HPU eager)
+    requires int64.
+    """
+    if indices.dtype == torch.int64:
+        return indices
+    if torch.compiler.is_compiling():
+        return indices if indices.device.type == "hpu" else indices.long()
+    if indices.device.type == "hpu" and htorch.utils.internal.is_lazy():
+        return indices
+    return indices.long()
+
+
 class VLLMKVCache(torch.nn.Module):
 
     def __init__(self, is_v_cache: bool = False):
@@ -72,7 +88,7 @@ class VLLMKVCache(torch.nn.Module):
         # In cross-attention kv cache forward inputs are None in decode
         # We don't want to store them in the cache in such case
         if input is not None:
-            cache.index_copy_(0, slot_mapping, input)
+            cache.index_copy_(0, index_copy_indices(slot_mapping), input)
         return cache
 
     def fetch_from_cache(self, cache, blocks, scales=None, **kwargs):

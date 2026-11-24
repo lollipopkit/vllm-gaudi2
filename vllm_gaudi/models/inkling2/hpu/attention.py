@@ -43,6 +43,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
 )
 
+from vllm_gaudi.extension.utils import index_copy_indices
+
 from ..configs import Inkling2ModelConfig
 from .ops import GAUDI2_FP8_MAX, fp8_linear, gate_sink, l2_clip, quantize_fp8_hpu, weightless_rms_norm
 from .sconv import Inkling2HPUConvState, Inkling2HPUShortConv, K_STREAM, V_STREAM
@@ -322,6 +324,7 @@ def _write_kv_to_paged_cache(
             slots = torch.remainder(slot_mapping.reshape(-1).long(), key_cache.shape[0])
             if key_cache.device.type == "hpu":
                 slots = slots.to(torch.int32)
+        slots = index_copy_indices(slots)
         key_cache.index_copy_(0, slots, k.to(key_cache.dtype))
         value_cache.index_copy_(0, slots, v.to(value_cache.dtype))
         return

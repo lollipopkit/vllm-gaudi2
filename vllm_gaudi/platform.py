@@ -11,6 +11,21 @@ from vllm import envs
 from vllm.platforms import Platform, PlatformEnum
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.extension.logger import logger as init_logger
+from vllm_gaudi.kimi_k3_gate import is_kimi_k3_vllm_config, kimi_k3_seen, mark_kimi_k3_seen
+
+
+class _KimiK3OnlyList:
+    """Class attribute that reads as ``values`` once a Kimi-K3 config exists in this process and as ``[]`` before."""
+
+    def __init__(self, values):
+        self._values = list(values)
+
+    def __get__(self, obj, owner=None):
+        return list(self._values) if kimi_k3_seen() else []
+
+
+if not hasattr(Platform, "is_hpu"):
+    Platform.is_hpu = lambda self: getattr(self, "device_type", None) == "hpu"
 
 if TYPE_CHECKING:
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -63,11 +78,52 @@ class HpuPlatform(Platform):
     dispatch_key: str = "HPU"
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
+    # Kimi-K3 only (TP16 Ray: every worker must see the node's HABANA_VISIBLE_MODULES); empty, i.e. the upstream
+    # Platform default, for every other model.
+    ray_noset_device_env_vars = _KimiK3OnlyList([
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
+    ])
     supported_quantization: list[str] = [
-        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4", "inkling2_fp8"
+        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4", "mxfp4",
+        "inkling2_fp8"
     ]
     simple_compile_backend = "hpu_backend"
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
+
+    # VLLM_* variables read by vllm-gaudi itself. Only used by the fallback below, when the vLLM Platform has no
+    # validate_environ. vLLM calls it in EngineArgs.create_engine_config before any ModelConfig exists, so it cannot
+    # be gated per model: every model takes the upstream check, and a Kimi-K3 run may log 'Unknown vLLM environment
+    # variable' warnings for these names (log only).
+    gaudi_env_vars: tuple[str, ...] = (
+        "VLLM_BUCKETING_FROM_FILE",
+        "VLLM_EXPONENTIAL_BUCKETING",
+        "VLLM_FULL_WARMUP",
+        "VLLM_GRAPH_RESERVED_MEM",
+        "VLLM_HPU_BIND_NUMA",
+        "VLLM_MOE_CHUNK",
+        "VLLM_MOE_TOKEN_BOUNDARY",
+        "VLLM_MULTIMODAL_RESOLUTIONS",
+        "VLLM_SKIP_WARMUP",
+        "VLLM_WEIGHT_LOAD_FORCE_SYNC",
+    )
+
+    @classmethod
+    def validate_environ(cls, hard_fail: bool) -> None:
+        upstream = getattr(super(), "validate_environ", None)
+        if upstream is not None:
+            return upstream(hard_fail)
+        import vllm_gaudi.envs as gaudi_envs
+        known = set(envs.environment_variables) | set(gaudi_envs.environment_variables) | set(cls.gaudi_env_vars)
+        for env in os.environ:
+            if env.startswith("VLLM_") and env not in known:
+                if hard_fail:
+                    raise ValueError(f"Unknown vLLM environment variable detected: {env}")
+                logger.warning("Unknown vLLM environment variable detected: %s", env)
+
+    @classmethod
+    def is_hpu(cls) -> bool:
+        return True
 
     @classmethod
     def get_attn_backend_cls(
@@ -128,7 +184,7 @@ class HpuPlatform(Platform):
         # The correct implementation of the method in this place should look as follows:
         # total_hpu_memory = torch.hpu.mem_get_info()[1]
         # A value of 0 is returned to preserve the current logic in
-        # vllm/vllm/engine/arg_utils.py → get_batch_defaults() →
+        # vllm/engine/arg_utils.py → get_batch_defaults() →
         # default_max_num_batched_tokens, in order to avoid the
         # error in hpu_perf_test, while also preventing a
         # NotImplementedError in test_defaults_with_usage_context.
@@ -146,6 +202,8 @@ class HpuPlatform(Platform):
         # a lazy-mode subprocess (GAUDISW-248809) and always respect values the
         # user set explicitly (GAUDISW-249135).
         cls.set_compile_env_defaults()
+        if is_kimi_k3_vllm_config(vllm_config):
+            mark_kimi_k3_seen()
         cls._maybe_disable_synapse_input_reuse(vllm_config)
         parallel_config = vllm_config.parallel_config
 
@@ -279,13 +337,150 @@ class HpuPlatform(Platform):
         # Disable multi-stream for shared experts as no Stream on CPU
         os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
-        # NOTE: vLLM has default enabled async scheduling with speculative decoding is on.
-        # On HPU only DFlash supports it (drafting deferred to the next step, see HPUModelRunner).
+        # NOTE: vLLM enables async scheduling by default, also with speculative
+        # decoding. The HPU runner supports the two together for DFlash
+        # (drafting deferred to the next step, see HPUModelRunner) and for one
+        # draft token of an EAGLE-style drafter (EAGLE, EAGLE3, MTP), by default
+        # only on Nemotron-H (see _async_spec_decode_enabled); otherwise
+        # speculative decoding runs with synchronous scheduling.
         spec_config = vllm_config.speculative_config
-        vllm_config.scheduler_config.async_scheduling = \
-            vllm_config.scheduler_config.async_scheduling and (spec_config is None or spec_config.use_dflash())
+        if spec_config is not None and vllm_config.scheduler_config.async_scheduling and not (
+                spec_config.use_dflash() or (cls._async_spec_decode_enabled(vllm_config) and spec_config.use_eagle()
+                                             and spec_config.num_speculative_tokens == 1)):
+            vllm_config.scheduler_config.async_scheduling = False
+        # Since the Model Runner V1 removal (vLLM aac1b2a4f3) vLLM enables async scheduling for pipeline
+        # parallelism too; the HPU runner does not support that combination.
+        if vllm_config.scheduler_config.async_scheduling and vllm_config.parallel_config.pipeline_parallel_size > 1:
+            logger.warning("[HPU] Async scheduling is not supported with pipeline parallelism; disabling it.")
+            vllm_config.scheduler_config.async_scheduling = False
+        # Runs after the async scheduling decisions above, which it depends on.
+        cls._maybe_use_hpu_scheduler(vllm_config)
+        cls._reject_unsupported_engine_features(vllm_config)
 
         cls._maybe_disable_chunked_mm_input(vllm_config)
+
+    @classmethod
+    def _maybe_use_hpu_scheduler(cls, vllm_config: VllmConfig) -> None:
+        """Keep HPUAsyncScheduler's prefill chunks for synchronous speculative decoding on hybrids.
+
+        With prefix caching, upstream's synchronous scheduler ends the prefill
+        chunks of a hybrid model on KV cache block boundaries. HPUScheduler
+        splits them as HPUAsyncScheduler does, on the mamba chunk grid that the
+        HPU prefill path and its buckets expect.
+        """
+        scheduler_config = vllm_config.scheduler_config
+        if (vllm_config.speculative_config is not None and not scheduler_config.async_scheduling
+                and scheduler_config.scheduler_cls is None and vllm_config.cache_config.enable_prefix_caching
+                and getattr(vllm_config.model_config, 'is_hybrid', False)):
+            scheduler_config.scheduler_cls = "vllm_gaudi.v1.core.sched.hpu_scheduler.HPUScheduler"
+
+    @classmethod
+    def _async_spec_decode_enabled(cls, vllm_config: VllmConfig) -> bool:
+        """Whether async scheduling may stay on with speculative decoding.
+
+        Mirrors the async_spec_decode feature value, which the worker resolves
+        once it knows the model type; the runtime config does not know it yet
+        at engine-construction time. On by default for Nemotron-H unless
+        contiguous PA is on. An explicitly set VLLM_HPU_ASYNC_SPEC_DECODE takes
+        precedence. With prefix caching on a hybrid model, the mamba state
+        blocks of a step follow the tokens the previous step accepted, so the
+        runner decides them on the device (see
+        HPUModelRunner._copy_mamba_spec_boundary_states_async).
+        """
+        explicit = get_config().VLLM_HPU_ASYNC_SPEC_DECODE
+        model_config = getattr(vllm_config, 'model_config', None)
+        if explicit is not None:
+            return explicit
+        return (model_config is not None and getattr(model_config.hf_config, 'model_type', None) == 'nemotron_h'
+                and not get_config().VLLM_CONTIGUOUS_PA)
+
+    @classmethod
+    def _reject_unsupported_engine_features(cls, vllm_config: "VllmConfig") -> None:
+        """Fail at startup on features the HPU model runner would silently ignore.
+
+        Model Runner V1 refused the same features at startup; that check went with it in vLLM aac1b2a4f3.
+        """
+        unsupported = cls._unsupported_engine_features(vllm_config)
+        if unsupported:
+            raise ValueError(f"HPU does not support: {', '.join(unsupported)}.")
+
+    @staticmethod
+    def _unsupported_engine_features(vllm_config: "VllmConfig") -> list[str]:
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
+        spec = vllm_config.speculative_config
+        unsupported: list[str] = []
+        # model_config may be None in tests; getattr then yields the default.
+        for option in ("return_sampling_mask", "enable_trace_replay"):
+            if getattr(model_config, option, False):
+                unsupported.append(option)
+        if getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None:
+            unsupported.append("HiSparse")
+        if getattr(vllm_config, "watermark_config", None) is not None:
+            unsupported.append("watermarking")
+        if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
+            unsupported.append("prefill context parallel")
+        if spec is not None:
+            from vllm.v1.worker.gpu.spec_decode.xpress.config import XPressSpeculatorConfig
+
+            if spec.custom_method is not None:
+                unsupported.append(f"custom speculative method '{spec.custom_method}'")
+            if spec.method == "dspark":
+                unsupported.append("dspark speculative decoding")
+            elif isinstance(spec.speculator_config, XPressSpeculatorConfig):
+                unsupported.append("xpress speculative decoding")
+            if spec.enable_adaptive_verification:
+                unsupported.append("adaptive draft verification")
+            if spec.draft_lm_head_quantization is not None:
+                unsupported.append("draft lm_head quantization")
+            draft_config = spec.draft_model_config
+            draft_archs = set(getattr(draft_config, "architectures", None) or [])
+            if "ParseAuxMTPModel" in draft_archs:
+                unsupported.append("Parse 3.5 MTP")
+            if spec.method == "dflash" and draft_config is not None:
+                layer_types = getattr(draft_config.hf_config, "layer_types", None) or []
+                num_sliding = sum(lt == "sliding_attention" for lt in layer_types)
+                if 0 < num_sliding < len(layer_types):
+                    unsupported.append("mixed sliding/full dflash drafts")
+                candidate_head_archs = {
+                    "DFlash2BeamDraftModel", "DFlash2RicursiveDraftModel", "LiLiCorrDraftModel"
+                }
+                if not HpuPlatform.supports_v1_dflash_candidate_heads():
+                    candidate_head_archs.add("DFlash2DraftModel")
+                if draft_archs & candidate_head_archs:
+                    unsupported.append("DFlash candidate-head drafts")
+        if getattr(model_config, "is_diffusion", False):
+            unsupported.append("diffusion models")
+        if getattr(parallel_config, "enable_batch_sharded_sampling", False):
+            unsupported.append("batch-sharded sampling")
+        if getattr(model_config, "architecture", None) in ("Step5ForCausalLM", "Step5ForConditionalGeneration"):
+            unsupported.append("Step5")
+        return unsupported
+
+    @classmethod
+    def validate_request(cls, processed_inputs, params) -> None:
+        """Reject per-request logprob features the HPU model runner does not implement.
+
+        vLLM refused the prompt-logprob ones and beam search allowlists for Model Runner V1 itself; without it,
+        they would be accepted and ignored. Exact-ID sample logprobs (``logprob_token_ids``) were never read on
+        HPU: such a request gets an empty or partial logprobs list. Beam search allowlists set that field for each
+        step, so this check covers them too.
+        """
+        from vllm.exceptions import VLLMValidationError
+        from vllm.sampling_params import SamplingParams
+
+        if not isinstance(params, SamplingParams):
+            return
+        unsupported = {
+            "prompt_logprob_token_ids": getattr(params, "prompt_logprob_token_ids", None) is not None,
+            "prompt_logprob_start": getattr(params, "prompt_logprob_start", None) not in (None, 0),
+            "logprob_token_ids": bool(getattr(params, "logprob_token_ids", None)),
+        }
+        # Callers may not have set the field themselves.
+        hints = {"logprob_token_ids": " (beam search allowed_token_ids and generative scoring label_token_ids set it)"}
+        for name, is_set in unsupported.items():
+            if is_set:
+                raise VLLMValidationError(f"{name} is not supported on HPU{hints.get(name, '')}.", parameter=name)
 
     @classmethod
     def _maybe_disable_chunked_mm_input(cls, vllm_config: "VllmConfig") -> None:

@@ -1,6 +1,6 @@
 This repository is based on vLLM Hardware Plugin for Intel Gaudi
 (https://github.com/vllm-project/vllm-gaudi), Apache License 2.0,
-starting from commit 827b0092b0143cbe5516eb84cf052902b163560b.
+tracking upstream through commit 9b9b2644913557f57c8ea7932873b3b441261cf1.
 
 Third-party components included or adapted:
 

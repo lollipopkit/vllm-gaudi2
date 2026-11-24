@@ -32,15 +32,20 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_PREFILL_TUNING: str = ""
     VLLM_HPU_GDN_TPC_DECODE: bool = False
     VLLM_HPU_LFM3_PACKED_TOWER: bool = True
+    HPU_KIMI_SITU_IMPL: str = "exact"
+    HPU_KIMI_VIT_DP: bool = False
+    HPU_KIMI_PREFILL_MERGE: bool = False
+    HPU_KIMI_KDA_PREFILL_CHUNK: str = "64,16"
+    HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
+    VLLM_HPU_TWO_STAGE_TOPK: bool = True
+    VLLM_HPU_MIN_PREFILL_CHUNK: str = ""
 
 
 def _bool_env(name: str, default: str) -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true")
 
-
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
-
 # begin-env-vars-definition
 environment_variables: dict[str, Callable[[], Any]] = {
     # Contiguous cache fetching to avoid using costly gather operation on
@@ -179,6 +184,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_LFM3_PACKED_TOWER":
     lambda: _bool_env("VLLM_HPU_LFM3_PACKED_TOWER", "true"),
 
+    # Kimi-K3 routed experts use the SiTU activation (beta*tanh(gate/beta)*sigmoid(gate)*up, soft-clipped up), which
+    # the Habana fused MoE op does not have. "exact" computes the experts unfused with the real activation (MXFP4
+    # weights dequantized per expert chunk); "silu" maps SiTU to silu in the fused kernel (fast, APPROXIMATE).
+    "HPU_KIMI_SITU_IMPL":
+    lambda: os.environ.get("HPU_KIMI_SITU_IMPL", "exact").strip().lower(),
+
+    # Kimi-K3 video: shard the video chunks of the vision tower across the TP ranks
+    "HPU_KIMI_VIT_DP":
+    lambda: os.environ.get("HPU_KIMI_VIT_DP", "0").strip().lower() in ("1", "true", "on", "yes"),
+
+    # Kimi-K3 KDA prefill "<chunk_size>,<vec_chunks>" (see kda_chunked_steps_vec)
+    "HPU_KIMI_KDA_PREFILL_CHUNK":
+    lambda: os.environ.get("HPU_KIMI_KDA_PREFILL_CHUNK", "64,16"),
+
+    # Kimi-K3 KDA prefill: rows per block of the blockwise intra-chunk A / Aqk ("0" = full pairwise decay)
+    "HPU_KIMI_KDA_INTRA_SUB_CHUNK":
+    lambda: os.environ.get("HPU_KIMI_KDA_INTRA_SUB_CHUNK", "0"),
+
+    # Kimi-K3 (no prefix caching): let several fresh prompts share one padded prefill batch
+    "HPU_KIMI_PREFILL_MERGE":
+    lambda: os.environ.get("HPU_KIMI_PREFILL_MERGE", "0").strip().lower() in ("1", "true"),
+
+    # Grouped top-k router: top-k of wide expert rows (>= 512 experts) as a top-k per 128 experts, then over the winners
+    "VLLM_HPU_TWO_STAGE_TOPK":
+    lambda: os.environ.get("VLLM_HPU_TWO_STAGE_TOPK", "1").strip().lower() in ("1", "true"),
+
+    # Async scheduler: smallest first chunk of a new prefill that may join a step already carrying another prefill
+    # (integer, empty or 0 = off)
+    "VLLM_HPU_MIN_PREFILL_CHUNK":
+    lambda: os.environ.get("VLLM_HPU_MIN_PREFILL_CHUNK", ""),
 }
 
 # end-env-vars-definition

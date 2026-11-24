@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM, DFlash2Qwen3Model
 
+from vllm_gaudi.extension.utils import index_copy_indices
 from vllm_gaudi.v1.spec_decode.dflash_ops import (chunked_topk, compute_context_kv, greedy_candidate_walk,
                                                   score_edges)
 
@@ -64,6 +65,7 @@ class HpuDFlash2Qwen3Model(DFlash2Qwen3Model):
                                   v_scale=self._v_scale)
 
     def store_context_kv(self, keys: torch.Tensor, values: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+        slot_mapping = index_copy_indices(slot_mapping)
         for i, attn in enumerate(self._attn_layers):
             kv_cache = attn.kv_cache
             if not isinstance(kv_cache, (tuple, list)):

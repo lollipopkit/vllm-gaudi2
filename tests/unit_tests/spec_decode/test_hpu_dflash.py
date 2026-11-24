@@ -212,3 +212,63 @@ def test_chunked_topk_matches_topk():
     ref_values, ref_ids = torch.topk(scores, 16, dim=-1)
     torch.testing.assert_close(values, ref_values)
     assert torch.equal(ids, ref_ids)
+
+
+def test_store_context_kv_accepts_int32_slot_mapping_eager():
+    from vllm_gaudi.extension.utils import VLLMKVCache
+    from vllm_gaudi.models.qwen3_dflash2 import HpuDFlash2Qwen3Model
+
+    k_cache = torch.zeros(16, 2, 4, dtype=torch.bfloat16)
+    v_cache = torch.zeros(16, 2, 4, dtype=torch.bfloat16)
+    attn = SimpleNamespace(
+        kv_cache=(k_cache, v_cache),
+        impl=SimpleNamespace(k_cache=VLLMKVCache(), v_cache=VLLMKVCache(is_v_cache=True)),
+    )
+    model = SimpleNamespace(_attn_layers=[attn])
+    keys = torch.arange(1, 17, dtype=torch.bfloat16).view(1, 2, 2, 4)
+    values = -keys
+    slots = torch.tensor([3, 11], dtype=torch.int32)
+    HpuDFlash2Qwen3Model.store_context_kv(model, keys, values, slots)
+    torch.testing.assert_close(k_cache[slots.long()], keys[0])
+    torch.testing.assert_close(v_cache[slots.long()], values[0])
+
+
+def test_hpu_dflash_proposer_init_parallel_drafting_defaults(monkeypatch):
+    from vllm_gaudi.v1._vendored.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+    from vllm_gaudi.v1.spec_decode.hpu_dflash import HpuDFlashProposer
+
+    hf_config = SimpleNamespace(
+        dflash_config={"mask_token_id": 248070},
+        layer_types=["sliding_attention"],
+        num_hidden_layers=1,
+        is_causal=False,
+    )
+    for parallel_drafting_cfg in (None, True):
+        spec_config = SimpleNamespace(
+            method="dflash",
+            num_speculative_tokens=7,
+            parallel_drafting=parallel_drafting_cfg,
+            draft_model_config=SimpleNamespace(hf_config=hf_config),
+        )
+        vllm_config = SimpleNamespace(speculative_config=spec_config)
+
+        def fake_super_init(self, *, vllm_config, device, pass_hidden_states_to_model, runner):
+            self.vllm_config = vllm_config
+            self.speculative_config = vllm_config.speculative_config
+            self.draft_model_config = vllm_config.speculative_config.draft_model_config
+            self.num_speculative_tokens = vllm_config.speculative_config.num_speculative_tokens
+            self.parallel_drafting = vllm_config.speculative_config.parallel_drafting
+            self.parallel_drafting_token_id = 0
+            self.parallel_drafting_hidden_state_tensor = (
+                torch.empty(4) if parallel_drafting_cfg else None
+            )
+
+        monkeypatch.setattr(SpecDecodeBaseProposer, "__init__", fake_super_init)
+        proposer = HpuDFlashProposer(vllm_config=vllm_config, device=torch.device("cpu"))
+        assert proposer.parallel_drafting is True
+        assert proposer.parallel_drafting_token_id == 248070
+        assert proposer.parallel_drafting_hidden_state_tensor is None
+        assert proposer.extra_slots_per_request == 7
+        assert proposer.net_num_new_slots_per_request == 7
+        assert proposer.needs_extra_input_slots is True
+        assert proposer.dflash_causal is False

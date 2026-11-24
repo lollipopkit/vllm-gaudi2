@@ -12,6 +12,7 @@ Covers:
   reconfigure paths.
 """
 import os
+import re
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
@@ -140,7 +141,12 @@ def test_pt_hpu_enable_lazy_collectives_default_and_respect():
     assert os.environ["PT_HPU_ENABLE_LAZY_COLLECTIVES"] == "false"
 
 
-def _fake_vllm_config(*, model_type="qwen3_next", gdn_layers=0, kv_transfer=None, prefix_caching=False):
+def _fake_vllm_config(*,
+                      model_type="qwen3_next",
+                      gdn_layers=0,
+                      kv_transfer=None,
+                      prefix_caching=False,
+                      is_hybrid=False):
     """Minimal vllm_config stub for the compact-GDN detection helpers."""
 
     def get_num_layers_by_block_type(parallel_config, block_type):
@@ -149,6 +155,7 @@ def _fake_vllm_config(*, model_type="qwen3_next", gdn_layers=0, kv_transfer=None
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(model_type=model_type),
         get_num_layers_by_block_type=get_num_layers_by_block_type,
+        is_hybrid=is_hybrid,
     )
     return SimpleNamespace(
         model_config=model_config,
@@ -199,6 +206,64 @@ def test_compact_gdn_explicit_env_overrides_auto_detection():
     assert HpuPlatform._compact_gdn_active(_fake_vllm_config(gdn_layers=0)) is True
     os.environ["VLLM_COMPACT_GDN"] = "0"  # force off where auto would be on
     assert HpuPlatform._compact_gdn_active(_fake_vllm_config(gdn_layers=4)) is False
+
+
+def _runtime_flags(*, async_spec_decode=None, contiguous_pa=None):
+    flags = SimpleNamespace(VLLM_HPU_ASYNC_SPEC_DECODE=async_spec_decode, VLLM_CONTIGUOUS_PA=contiguous_pa)
+    return patch("vllm_gaudi.platform.get_config", return_value=flags)
+
+
+def test_async_spec_decode_on_by_default_only_for_nemotron_h():
+    with _runtime_flags():
+        assert HpuPlatform._async_spec_decode_enabled(_fake_vllm_config(model_type="nemotron_h")) is True
+        assert HpuPlatform._async_spec_decode_enabled(_fake_vllm_config(model_type="llama")) is False
+
+
+def test_async_spec_decode_off_by_default_with_contiguous_pa():
+    with _runtime_flags(contiguous_pa=True):
+        assert HpuPlatform._async_spec_decode_enabled(_fake_vllm_config(model_type="nemotron_h")) is False
+
+
+def test_async_spec_decode_explicit_env_overrides_default():
+    with _runtime_flags(async_spec_decode=True):  # force on where the default is off
+        assert HpuPlatform._async_spec_decode_enabled(_fake_vllm_config(model_type="llama")) is True
+    with _runtime_flags(async_spec_decode=False):  # force off where the default is on
+        assert HpuPlatform._async_spec_decode_enabled(_fake_vllm_config(model_type="nemotron_h")) is False
+
+
+def test_async_spec_decode_stays_on_with_prefix_caching_on_hybrid_models():
+    # The runner decides the mamba state blocks on the device (see
+    # HPUModelRunner._copy_mamba_spec_boundary_states_async).
+    cfg = _fake_vllm_config(model_type="nemotron_h", prefix_caching=True, is_hybrid=True)
+    with _runtime_flags():
+        assert HpuPlatform._async_spec_decode_enabled(cfg) is True
+    with _runtime_flags(async_spec_decode=False):
+        assert HpuPlatform._async_spec_decode_enabled(cfg) is False
+
+
+@pytest.mark.parametrize("change", [
+    dict(),
+    dict(prefix_caching=False),
+    dict(is_hybrid=False),
+    dict(async_scheduling=True),
+    dict(speculative=False),
+    dict(scheduler_cls="my.Scheduler"),
+])
+def test_sync_spec_decode_with_prefix_caching_on_hybrids_uses_hpu_scheduler(change):
+    """HPUScheduler keeps HPUAsyncScheduler's prefill chunks when speculative decoding schedules synchronously."""
+    settings = dict(prefix_caching=True, is_hybrid=True, async_scheduling=False, speculative=True, scheduler_cls=None)
+    settings.update(change)
+    cfg = _fake_vllm_config(model_type="nemotron_h",
+                            prefix_caching=settings["prefix_caching"],
+                            is_hybrid=settings["is_hybrid"])
+    cfg.speculative_config = SimpleNamespace() if settings["speculative"] else None
+    cfg.scheduler_config = SimpleNamespace(async_scheduling=settings["async_scheduling"],
+                                           scheduler_cls=settings["scheduler_cls"])
+
+    HpuPlatform._maybe_use_hpu_scheduler(cfg)
+
+    expected = "vllm_gaudi.v1.core.sched.hpu_scheduler.HPUScheduler" if not change else settings["scheduler_cls"]
+    assert cfg.scheduler_config.scheduler_cls == expected
 
 
 def test_disables_synapse_input_reuse_on_auto_detected_compact_gdn():
@@ -330,13 +395,13 @@ def _non_hybrid_vllm_config(block_size, user_specified):
     )
 
 
-def test_update_block_size_restores_hpu_default_after_multi_backend_selection():
-    """Llama-4 keeps two backends, so upstream selection returns the default
-    block size of 16 and the HPU guard must put 128 back.
+def test_update_block_size_keeps_128_for_llama4_multi_backend_selection():
+    """Llama-4 keeps two backends that both prefer 128.
 
-    Only the backend list is patched. The real Platform selection runs, and
-    the restore log must fire. A pin that never selects 16 leaves the
-    preferred 128 in place without logging, and this test fails.
+    Only the backend list is patched and the real Platform selection runs.
+    vLLM before vllm-project/vllm#60892 returns the default block size and
+    the HPU guard puts 128 back. Later vLLM selects 128 directly. Either way
+    the KV cache must use 128.
     """
     from vllm.platforms import Platform
     from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionBackendV1
@@ -360,7 +425,23 @@ def test_update_block_size_restores_hpu_default_after_multi_backend_selection():
             Platform,
             "_find_non_ssm_backends",
             return_value=[HPUAttentionBackendV1, _ChunkedLocalHPUAttentionBackendV1],
-    ), patch("vllm_gaudi.platform.logger") as log:
+    ):
+        HpuPlatform.update_block_size_for_backend(vllm_config)
+
+    assert vllm_config.cache_config.block_size == 128
+
+
+def test_update_block_size_restores_hpu_default_after_multi_backend_selection():
+    from vllm.config.cache import CacheConfig
+    from vllm.platforms import Platform
+
+    vllm_config = _non_hybrid_vllm_config(block_size=128, user_specified=False)
+
+    def _select_default_block_size(vllm_config):
+        vllm_config.cache_config.block_size = CacheConfig.DEFAULT_BLOCK_SIZE
+
+    with patch.object(Platform, "update_block_size_for_backend",
+                      _select_default_block_size), patch("vllm_gaudi.platform.logger") as log:
         HpuPlatform.update_block_size_for_backend(vllm_config)
 
     assert vllm_config.cache_config.block_size == 128
@@ -473,3 +554,150 @@ def test_check_and_update_config_does_not_rescale_granitemoehybrid_mamba_page_si
         f"granitemoehybrid models. Expected {CORRECT_MAMBA_PAGE_SIZE_PADDED}, "
         f"got {cache_config.mamba_page_size_padded} "
         f"(would be {CORRUPTED_MAMBA_PAGE_SIZE_PADDED} if rescaled with block_size=128).")
+
+
+@pytest.mark.parametrize("field, value", [
+    ("prompt_logprob_token_ids", [[1, 2]]),
+    ("prompt_logprob_start", 1),
+    ("logprob_token_ids", [1, 2]),
+])
+def test_validate_request_rejects_features_the_runner_ignores(field, value):
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+
+    params = SamplingParams(max_tokens=4)
+    setattr(params, field, value)
+    with pytest.raises(VLLMValidationError, match=f"{field} is not supported on HPU") as excinfo:
+        HpuPlatform.validate_request(None, params)
+    assert excinfo.value.parameter == field
+
+
+def test_validate_request_accepts_prompt_logprobs_start_zero_and_thinking_budget():
+    from vllm.sampling_params import SamplingParams
+
+    params = SamplingParams(max_tokens=4, prompt_logprobs=1)
+    # Scoring from the first row is the default, so it stays accepted.
+    params.prompt_logprob_start = 0
+    # Accepted (and not enforced) on HPU before the Model Runner V1 removal too.
+    params.thinking_token_budget = 8
+    HpuPlatform.validate_request(None, params)
+
+
+def _engine_config(*, async_scheduling=False, pipeline_parallel_size=1, speculative_config=None):
+    """A minimal non-hybrid config that check_and_update_config accepts."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="meta-llama/Llama-3.1-8B-Instruct",
+            is_hybrid=False,
+            architecture="LlamaForCausalLM",
+            hf_config=SimpleNamespace(model_type="llama"),
+            dtype=torch.bfloat16,
+            quantization=None,
+        ),
+        cache_config=SimpleNamespace(block_size=128, user_specified_block_size=False, enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(worker_cls="auto",
+                                        distributed_executor_backend="mp",
+                                        pipeline_parallel_size=pipeline_parallel_size),
+        compilation_config=SimpleNamespace(custom_ops=[], cudagraph_mode=None, cudagraph_capture_sizes=[], mode=None),
+        load_config=SimpleNamespace(device=None),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling, scheduler_cls=None),
+        speculative_config=speculative_config,
+    )
+
+
+def _spec_config(**overrides):
+    fields = dict(method="eagle",
+                  custom_method=None,
+                  speculator_config=object(),
+                  enable_adaptive_verification=False,
+                  draft_lm_head_quantization=None,
+                  draft_model_config=SimpleNamespace(architectures=["EagleLlamaForCausalLM"],
+                                                     hf_config=SimpleNamespace()))
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _run_check_and_update_config(vllm_config):
+    from vllm.platforms import Platform
+
+    with patch.object(Platform, "check_and_update_config"), \
+         patch.object(HpuPlatform, "set_compile_env_defaults"):
+        HpuPlatform.check_and_update_config(vllm_config)
+
+
+def _xpress_spec():
+    from vllm.v1.worker.gpu.spec_decode.xpress.config import XPressSpeculatorConfig
+
+    return _spec_config(method="dflash", speculator_config=mock.Mock(spec=XPressSpeculatorConfig))
+
+
+def _dflash_spec(architectures, layer_types=None):
+    return _spec_config(method="dflash",
+                        draft_model_config=SimpleNamespace(architectures=architectures,
+                                                           hf_config=SimpleNamespace(layer_types=layer_types)))
+
+
+# Model Runner V1 refused each of these at startup; the HPU platform keeps refusing them.
+_UNSUPPORTED_ENGINE_FEATURES = [
+    ("return_sampling_mask", lambda c: setattr(c.model_config, "return_sampling_mask", True)),
+    ("enable_trace_replay", lambda c: setattr(c.model_config, "enable_trace_replay", True)),
+    ("HiSparse", lambda c: setattr(c, "attention_config", SimpleNamespace(hisparse_config=object()))),
+    ("watermarking", lambda c: setattr(c, "watermark_config", object())),
+    ("prefill context parallel", lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2)),
+    ("custom speculative method 'mine'",
+     lambda c: setattr(c, "speculative_config", _spec_config(custom_method="mine"))),
+    ("dspark speculative decoding", lambda c: setattr(c, "speculative_config", _spec_config(method="dspark"))),
+    ("xpress speculative decoding", lambda c: setattr(c, "speculative_config", _xpress_spec())),
+    ("adaptive draft verification",
+     lambda c: setattr(c, "speculative_config", _spec_config(enable_adaptive_verification=True))),
+    ("draft lm_head quantization",
+     lambda c: setattr(c, "speculative_config", _spec_config(draft_lm_head_quantization="fp8"))),
+    ("Parse 3.5 MTP", lambda c: setattr(c, "speculative_config", _dflash_spec(["ParseAuxMTPModel"]))),
+    ("mixed sliding/full dflash drafts", lambda c: setattr(
+        c, "speculative_config", _dflash_spec(["DFlashDraftModel"], ["sliding_attention", "full_attention"]))),
+    ("DFlash candidate-head drafts", lambda c: setattr(c, "speculative_config", _dflash_spec(["DFlash2BeamDraftModel"]))),
+    ("diffusion models", lambda c: setattr(c.model_config, "is_diffusion", True)),
+    ("batch-sharded sampling", lambda c: setattr(c.parallel_config, "enable_batch_sharded_sampling", True)),
+    ("Step5", lambda c: setattr(c.model_config, "architecture", "Step5ForCausalLM")),
+]
+
+
+@pytest.mark.parametrize("feature, enable",
+                         _UNSUPPORTED_ENGINE_FEATURES,
+                         ids=[f for f, _ in _UNSUPPORTED_ENGINE_FEATURES])
+def test_unsupported_engine_features_fail_at_startup(feature, enable):
+    vllm_config = _engine_config()
+    enable(vllm_config)
+    with pytest.raises(ValueError, match=f"HPU does not support: {re.escape(feature)}\\."):
+        _run_check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(
+    "speculative_config",
+    [None, _spec_config(), _dflash_spec(["DFlashDraftModel"], ["full_attention"]),
+     _dflash_spec(["DFlash2DraftModel"], ["sliding_attention"])])
+def test_supported_engine_config_passes_startup(speculative_config):
+    _run_check_and_update_config(_engine_config(speculative_config=speculative_config))
+
+
+@pytest.mark.parametrize("pipeline_parallel_size, expected", [(1, True), (2, False)])
+def test_async_scheduling_is_disabled_with_pipeline_parallelism(pipeline_parallel_size, expected):
+    vllm_config = _engine_config(async_scheduling=True, pipeline_parallel_size=pipeline_parallel_size)
+    _run_check_and_update_config(vllm_config)
+    assert vllm_config.scheduler_config.async_scheduling is expected
+
+
+@pytest.mark.parametrize("allowed_token_ids, refused", [(None, False), ([1, 2], True)])
+def test_beam_search_step_with_allowlist_is_refused(allowed_token_ids, refused):
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import BeamSearchParams, SamplingParams
+
+    # The per-step params beam search builds, as upstream's configure_logprobs sets them.
+    params = SamplingParams(logprobs=4, max_tokens=1)
+    config = SimpleNamespace(speculative_config=None, model_config=SimpleNamespace(is_diffusion=False))
+    BeamSearchParams(beam_width=2, max_tokens=4, allowed_token_ids=allowed_token_ids).configure_logprobs(params, config)
+    if not refused:
+        HpuPlatform.validate_request(None, params)
+        return
+    with pytest.raises(VLLMValidationError, match="logprob_token_ids is not supported on HPU"):
+        HpuPlatform.validate_request(None, params)

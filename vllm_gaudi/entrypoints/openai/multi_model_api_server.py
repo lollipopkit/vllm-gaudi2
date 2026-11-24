@@ -42,6 +42,7 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.system_utils import decorate_logs
+from vllm.v1.engine import CheckpointState, PauseMode
 
 from vllm_gaudi.v1.engine.multi_model_async_llm import MultiModelAsyncLLM
 
@@ -147,14 +148,14 @@ class MultiModelEngineClient(EngineClient):
             reset_connector=reset_connector,
         )
 
-    async def sleep(self, level: int = 1, mode: str = "abort") -> None:
-        await self._engine.sleep(level=level, mode=mode)
+    async def sleep(self, level: int = 1, mode: str = "abort", reset_connector: bool = True) -> None:
+        await self._engine.sleep(level=level, mode=mode, reset_connector=reset_connector)
 
-    async def release_kv_cache_memory(self) -> None:
-        await self._engine.release_kv_cache_memory()
+    async def release_kv_cache_memory(self, reset_connector: bool = True) -> None:
+        await self._engine.release_kv_cache_memory(reset_connector=reset_connector)
 
-    async def wake_up(self, tags: list[str] | None = None) -> None:
-        await self._engine.wake_up(tags=tags)
+    async def wake_up(self, tags: list[str] | None = None) -> bool:
+        return await self._engine.wake_up(tags=tags)
 
     async def notify_kv_transfer_request_rejected(
         self,
@@ -172,6 +173,15 @@ class MultiModelEngineClient(EngineClient):
     async def is_sleeping(self) -> bool:
         return await self._engine.is_sleeping()
 
+    async def checkpoint_prepare(self, mode: PauseMode = "wait") -> str | None:
+        return await self._engine.checkpoint_prepare(mode)
+
+    async def checkpoint_restore(self) -> None:
+        await self._engine.checkpoint_restore()
+
+    async def checkpoint_state(self) -> tuple[CheckpointState, str | None]:
+        return await self._engine.checkpoint_state()
+
     async def add_lora(self, lora_request) -> bool:
         return await self._engine.add_lora(lora_request)
 
@@ -179,14 +189,9 @@ class MultiModelEngineClient(EngineClient):
         self,
         *,
         mode: str = "abort",
-        wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
     ) -> None:
-        await self._engine.pause_generation(
-            mode=mode,
-            wait_for_inflight_requests=wait_for_inflight_requests,
-            clear_cache=clear_cache,
-        )
+        await self._engine.pause_generation(mode=mode, clear_cache=clear_cache)
 
     async def resume_generation(self) -> None:
         await self._engine.resume_generation()

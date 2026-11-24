@@ -1,10 +1,10 @@
 # vllm-gaudi2
 
-Optimized vLLM hardware plugin for **Intel Gaudi2 (`HL-225`, 96 GiB HBM2e, 2.45 TB/s)**, based on [`vllm-project/vllm-gaudi`](https://github.com/vllm-project/vllm-gaudi) (`@827b0092`) with **zero modifications required to upstream [`vllm`](https://github.com/vllm-project/vllm)**.
+Optimized vLLM hardware plugin for **Intel Gaudi2 (`HL-225`, 96 GiB HBM2e, 2.45 TB/s)**, based on [`vllm-project/vllm-gaudi`](https://github.com/vllm-project/vllm-gaudi) (`@9b9b2644`) with **zero modifications required to upstream [`vllm`](https://github.com/vllm-project/vllm)**.
 
 Targets **Gaudi2 only** (not tested on Gaudi1 or Gaudi3). The Python package name remains `vllm_gaudi` for vLLM plugin discovery and upstream compatibility.
 
-> **Testbed & 350 W Power Cap**: All benchmarks below were measured on a single `HL-225` (PCIe Gen3 x16) **hard-capped at 350 W** (stock TDP: 600 W; compute-bound stages such as prefill and high-concurrency decode run power-limited), Ubuntu 24.04, SynapseAI 1.24.2, PyTorch 2.9+hpu.
+> **Testbed & 350 W Power Cap**: All benchmarks below were measured on a single `HL-225` (PCIe Gen3 x16) **hard-capped at 350 W** (stock TDP: 600 W; compute-bound stages such as prefill and high-concurrency decode run power-limited), Ubuntu 24.04, SynapseAI 1.24.2, PyTorch 2.13+hpu.
 
 ## Benchmarks (1× HL-225, **350 W cap**)
 
@@ -23,13 +23,12 @@ Targets **Gaudi2 only** (not tested on Gaudi1 or Gaudi3). The Python package nam
 
 ## Installation
 
-Install unmodified upstream `vllm` at the verified commit (`a0544b13f`), then install this plugin:
+Install unmodified upstream `vllm` at tag `v0.34.0`, then install this plugin:
 
 ```bash
 # 1. Upstream vLLM (empty target, reusing Habana PyTorch)
-git clone https://github.com/vllm-project/vllm.git
+git clone --branch v0.34.0 --depth 1 https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout a0544b13f2ee6424d3aa6d03a00e1c745218dee9
 pip install -r <(sed '/^torch/d' requirements/build/cuda.txt)
 VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e .
 cd ..

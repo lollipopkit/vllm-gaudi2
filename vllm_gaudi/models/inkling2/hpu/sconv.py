@@ -25,6 +25,8 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.selector import get_mamba_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_gaudi.extension.utils import index_copy_indices
+
 from .tpc_ops import has_tpc_sconv
 
 K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
@@ -279,7 +281,7 @@ class Inkling2HPUConvState(nn.Module, AttentionLayerBase):
         if safe_store is None:
             return
         state_buf = self._state_buffer()
-        state_buf.index_copy_(0, safe_store, torch.cat(parts, dim=-1))
+        state_buf.index_copy_(0, index_copy_indices(safe_store), torch.cat(parts, dim=-1))
 
 
 def _causal_conv_prefill_batch(

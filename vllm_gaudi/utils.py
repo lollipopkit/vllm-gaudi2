@@ -1,10 +1,12 @@
 from functools import cache
 import os
+import sys
 from vllm.config import ModelConfig
 import vllm.utils.torch_utils as torch_utils
 from vllm_gaudi.extension.runtime import get_config
 import vllm.v1.core.sched.async_scheduler as _async_sched_module
 from vllm_gaudi.v1.core.sched.hpu_async_scheduler import HPUAsyncScheduler
+from vllm_gaudi.v1._vendored import _compat as _vendored_compat
 from typing import Any, Optional, TypeVar, Union
 import torch
 import habana_frameworks.torch as htorch
@@ -71,7 +73,11 @@ def async_h2d_copy(source, dest_tensor=None, dtype=None, device="hpu"):
     return cpu_tensor.to(device, non_blocking=True)
 
 
-def async_h2d_update(source: torch.Tensor, dest: torch.Tensor, indices: list[int], device="hpu"):
+def async_h2d_update(source: torch.Tensor,
+                     dest: torch.Tensor,
+                     indices: list[int],
+                     device="hpu",
+                     indices_device: Optional[torch.Tensor] = None):
     """
     Asynchronously update specific rows of a device tensor from a CPU tensor.
 
@@ -80,8 +86,12 @@ def async_h2d_update(source: torch.Tensor, dest: torch.Tensor, indices: list[int
         dest: Device tensor to update
         indices: List of row indices in dest to update
         device: Target device
+        indices_device: The same indices already on the device, to reuse one
+            copy for several tensors
     """
-    idx = torch.tensor(indices, dtype=torch.long, device=device)
+    # A device tensor built straight from a list is a synchronous copy, which
+    # stalls the host on HPU.
+    idx = indices_device if indices_device is not None else async_h2d_copy(indices, dtype=torch.long, device=device)
     vals = source[indices].to(device, non_blocking=True)
     dest.index_copy_(0, idx, vals)
 
@@ -237,18 +247,26 @@ if not htorch.utils.internal.is_lazy():
 
         return tensor
 
-    torch_utils.make_tensor_with_pad = make_tensor_with_pad_hpu
+    # The vendored V1 helper replaces the upstream one, which aac1b2a4f3 removed. The vendored penalties module
+    # binds the name at import, so patch it too if it is already loaded; otherwise it picks up the HPU version.
+    _vendored_compat.make_tensor_with_pad = make_tensor_with_pad_hpu
+    _vendored_penalties: Any = sys.modules.get("vllm_gaudi.v1._vendored.sample.ops.penalties")
+    if _vendored_penalties is not None:
+        _vendored_penalties.make_tensor_with_pad = make_tensor_with_pad_hpu
+    if hasattr(torch_utils, "make_tensor_with_pad"):  # vLLM before aac1b2a4f3
+        torch_utils.make_tensor_with_pad = make_tensor_with_pad_hpu
 
 
 def make_mrope_positions_tensor_with_pad(input_positions: list[list[int]], input_mrope_positions: list[list[list[int]]],
                                          max_prompt_len: int, pad: int) -> list[list[int]]:
     # If no mrope positions, returns a flatten (seq_len,)
     if all(mrope_position is None for mrope_position in input_mrope_positions):
-        return torch_utils.make_tensor_with_pad(input_positions,
-                                                max_len=max_prompt_len,
-                                                pad=0,
-                                                dtype=torch.long,
-                                                device="cpu").flatten()
+        # The vendored helper: upstream removed torch_utils.make_tensor_with_pad in aac1b2a4f3.
+        return _vendored_compat.make_tensor_with_pad(input_positions,
+                                                     max_len=max_prompt_len,
+                                                     pad=0,
+                                                     dtype=torch.long,
+                                                     device="cpu").flatten()
     # Otherwise, Qwen2.5-VL expects positions in a (3, seq_len)
     # we are going to pad each seq_data in the list
     # using either MRope values or regular position

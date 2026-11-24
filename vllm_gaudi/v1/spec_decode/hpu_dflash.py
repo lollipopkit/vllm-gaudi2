@@ -3,14 +3,15 @@ import dataclasses
 from collections.abc import Callable
 
 import torch
-from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.config import VllmConfig
 
 from vllm_gaudi.utils import async_h2d_copy, slot_mapping_dtype
+from vllm_gaudi.v1._vendored.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm_gaudi.v1.spec_decode.dflash_ops import (block_mapping_from_groups, build_query_layout, window_block_bias)
 
 
-class HpuDFlashProposer(DFlashProposer):
+class HpuDFlashProposer(SpecDecodeBaseProposer):
     """DFlash2 drafting on HPU (greedy).
 
     Every target step writes the drafter's context K/V (from the target's aux hidden states) at the target's slots;
@@ -18,6 +19,51 @@ class HpuDFlashProposer(DFlashProposer):
     virtual decode rows that all see the whole block, and the candidate walk turns the mask rows into k drafts.
     The drafter layers share the target attention group's block table.
     """
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
+        assert vllm_config.speculative_config is not None
+        assert vllm_config.speculative_config.method == "dflash"
+        super().__init__(
+            vllm_config=vllm_config,
+            device=device,
+            pass_hidden_states_to_model=True,
+            runner=runner,
+        )
+        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
+        from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
+
+        # vLLM v0.34 deprecated SpeculativeConfig.parallel_drafting (None by default);
+        # DFlash always drafts in parallel and does not use EAGLE's mask_hidden tensor.
+        self.parallel_drafting = True
+        self.extra_slots_per_request = self.num_speculative_tokens
+        self.net_num_new_slots_per_request = self.extra_slots_per_request
+        self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
+        self.parallel_drafting_token_id = get_parallel_drafting_token_id(self.draft_model_config.hf_config)
+        self.parallel_drafting_hidden_state_tensor = None
+        self.dflash_causal = not dflash_has_any_non_causal(self.draft_model_config.hf_config)
+
+    @property
+    def dflash_config(self) -> dict:
+        return getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
+
+    def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
+        return self.dflash_config.get("use_aux_hidden_state", True)
+
+    def _create_draft_vllm_config(self) -> VllmConfig:
+        base = super()._create_draft_vllm_config()
+        arch = base.model_config.model_arch_config
+        if arch.is_mm_prefix_lm:
+            base.model_config.model_arch_config = dataclasses.replace(arch, is_mm_prefix_lm=False)
+        return dataclasses.replace(
+            base,
+            attention_config=dataclasses.replace(
+                base.attention_config,
+                use_non_causal=not self.dflash_causal,
+            ),
+        )
+
+    def _warn_if_multimodal(self) -> None:
+        pass
 
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)

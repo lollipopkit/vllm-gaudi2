@@ -13,18 +13,46 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
-from vllm.utils.collection_utils import swap_dict_values
+from vllm_gaudi.v1._vendored._compat import swap_dict_values
 from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.worker.block_table import MultiGroupBlockTable
-from vllm.v1.sample.logits_processor import (BatchUpdateBuilder, LogitsProcessors)
+from vllm_gaudi.v1._vendored.sample.metadata import SamplingMetadata
+from vllm_gaudi.v1._vendored.worker.block_table import MultiGroupBlockTable
+from vllm_gaudi.v1._vendored.sample.logits_processor import (BatchUpdateBuilder, LogitsProcessors)
 
 from vllm_gaudi.utils import async_h2d_copy, async_h2d_update
 from vllm_gaudi.v1.sample.hpu_penalties import HpuPenaltyStats, HpuSamplingMetadata
 
 _SAMPLING_EPS = 1e-5
+
+
+def splice_placeholders(output_token_ids: list[int], new_ids: list[int], num_slots: Optional[int] = None) -> None:
+    """Replace the newest -1 placeholders of ``output_token_ids`` in place with one step's sampled ids.
+
+    Under async scheduling every step appends a -1 per request, and the real ids are only spliced in while a
+    penalty or bad-words consumer needs them, so a request can also carry older placeholders, for tokens already in
+    the KV cache. Those stay, so the list length keeps matching the tokens in the KV cache.
+
+    With async speculative decoding the scheduler counts a placeholder for each of the step's tokens, its drafts
+    included, as if all were accepted, and the runner mirrors that count. Then num_slots is the step's count for the
+    request (1 + its drafts): its valid ids replace all of those newest placeholders, so the slots of rejected drafts
+    go, and older placeholders stay.
+
+    Args:
+        output_token_ids: a request's output ids, ending in -1 placeholders.
+        new_ids: that request's row of the step's sampled ids; -1 marks unused (rejected) slots.
+        num_slots: the newest placeholders the step's valid ids replace; default as many as there are valid ids.
+    """
+    if not new_ids:
+        return
+    num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
+    num_placeholders = 0
+    while (num_placeholders < len(output_token_ids) and output_token_ids[-1 - num_placeholders] == -1):
+        num_placeholders += 1
+    num_to_replace = min(num_sampled_ids if num_slots is None else num_slots, num_placeholders)
+    if num_to_replace:
+        output_token_ids[len(output_token_ids) - num_to_replace:] = new_ids[:min(num_sampled_ids, num_to_replace)]
 
 
 class HPUMultiGroupBlockTable(MultiGroupBlockTable):
@@ -132,7 +160,7 @@ class InputBatch:
         logitsprocs: Optional[LogitsProcessors] = None,
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
-        max_num_blocks: Optional[list[int]] = None,  # per group; default cdiv(max_model_len, block_size)
+        max_num_blocks_per_req: Optional[list[int]] = None,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -176,8 +204,15 @@ class InputBatch:
         # vLLM #40996 dropped max_model_len from MultiGroupBlockTable and now
         # requires the caller to pass the per-group block count. HPU does not
         # use DCP (cp_world_size == 1), so max_num_blocks reduces to
-        # cdiv(max_model_len, block_size) per KV cache group.
-        if max_num_blocks is None:
+        # cdiv(max_model_len, block_size) per KV cache group, unless the
+        # caller passes the KV cache specs' max_num_blocks_per_req (Mamba
+        # groups need 1 + num_speculative_tokens state blocks per request).
+        # Both are in KV-manager blocks; HPUMultiGroupBlockTable converts
+        # them to kernel blocks.
+        if max_num_blocks_per_req is not None:
+            assert len(max_num_blocks_per_req) == len(block_sizes)
+            max_num_blocks = list(max_num_blocks_per_req)
+        else:
             max_num_blocks = [cdiv(max_model_len, block_size) for block_size in block_sizes]
         self.block_table = HPUMultiGroupBlockTable(max_num_reqs=max_num_reqs,
                                                    max_num_batched_tokens=max_num_batched_tokens,
@@ -263,6 +298,11 @@ class InputBatch:
         # reordering persistent batch and generating logitsprocs batch state
         # updates. Should reset each step.
         self.batch_update_builder = BatchUpdateBuilder()
+
+        # Set by swap_states, which moves only the CPU copies of the per-row
+        # sampling params. The device copies are re-copied before the next
+        # selective sampling metadata is built (see _resync_moved_rows).
+        self._sampling_rows_moved = False
 
         # Store provided logitsprocs. If none are provided, initialize empty
         # data structure
@@ -388,7 +428,9 @@ class InputBatch:
 
             if sampling_params.logprobs is not None:
                 self.num_logprobs[req_id] = sampling_params.logprobs
-            if sampling_params.prompt_logprobs is not None:
+            # A request that already has outputs (resumed after preemption, or re-added after a skipped step)
+            # sent its prompt logprobs before; scoring the prompt again would send them twice.
+            if sampling_params.prompt_logprobs is not None and not request.output_token_ids:
                 self.num_prompt_logprobs[req_id] = (sampling_params.prompt_logprobs)
 
             if sampling_params.allowed_token_ids:
@@ -513,6 +555,8 @@ class InputBatch:
             self.repetition_penalties_cpu[i2], self.repetition_penalties_cpu[i1]
         self.min_p_cpu[i1], self.min_p_cpu[i2] =\
             self.min_p_cpu[i2], self.min_p_cpu[i1]
+        if i1 != i2:
+            self._sampling_rows_moved = True
 
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
@@ -624,6 +668,7 @@ class InputBatch:
         # TODO: follow upstream PR#16728 for enabling batch_update
         self._invalidate_prompt_token_ids_cache()
         self.sampling_metadata = self._make_sampling_metadata()
+        self._sampling_rows_moved = False
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
         num_reqs = self.num_reqs
@@ -712,21 +757,52 @@ class InputBatch:
         cached = cache.get(key)
         if cached is not None:
             return cached
-        index_cpu = torch.tensor(req_indices, dtype=torch.int64, device="cpu", pin_memory=self.pin_memory)
-        res = index_cpu.to(device=self.device, non_blocking=True)
+        if len(cache) >= 256:
+            cache.clear()
+        res = async_h2d_copy(req_indices, dtype=torch.long, device=self.device)
         cache[key] = res
         return res
+
+    @staticmethod
+    def _select_rows(tensor: torch.Tensor, gather: slice | torch.Tensor) -> torch.Tensor:
+        return tensor[gather] if isinstance(gather, slice) else tensor.index_select(0, gather)
+
+    def _resync_moved_rows(self) -> None:
+        """Copy every row's sampling params to the device after swap_states.
+
+        swap_states moves only the CPU copies. The device copies are otherwise
+        refreshed only when skip_copy is False (a request joined or left), so a
+        row that changed owner on any other step would be sampled with the
+        previous owner's temperature, top_p, top_k and penalties. Whole tensors
+        are copied so the shapes stay fixed.
+        """
+        async_h2d_copy(self.temperature_cpu_tensor, self.temperature)
+        async_h2d_copy(self.top_p_cpu_tensor, self.top_p)
+        async_h2d_copy(self.top_k_cpu_tensor, self.top_k)
+        if not self.no_penalties:
+            async_h2d_copy(self.frequency_penalties_cpu_tensor, self.frequency_penalties)
+            async_h2d_copy(self.presence_penalties_cpu_tensor, self.presence_penalties)
+            async_h2d_copy(self.repetition_penalties_cpu_tensor, self.repetition_penalties)
+        # The cached prompt token ids are in row order too.
+        self._invalidate_prompt_token_ids_cache()
+        self._sampling_rows_moved = False
 
     def make_selective_sampling_metadata(
         self,
         req_id_output_token_ids: list[tuple[str, list[int]]],
         skip_copy: bool = False,
     ) -> SamplingMetadata:
+        if self._sampling_rows_moved:
+            self._resync_moved_rows()
         req_indices: list[int] = [self.req_id_to_index[req_id] for req_id, _ in req_id_output_token_ids]
         # One gather index for every per-request device tensor below. Indexing an HPU tensor with a
         # python list builds a fresh index tensor and copies it synchronously each time; decode
         # batches are usually rows 0..n-1, which a slice view serves with no copy at all.
         gather = self._sampling_gather_index(req_indices)
+        idx: Optional[torch.Tensor] = None
+        if not skip_copy or not self.no_allowed_token_ids:
+            idx = gather if isinstance(gather, torch.Tensor) else async_h2d_copy(
+                req_indices, dtype=torch.long, device=self.device)
         prompt_token_ids = None
         penalty_prompt_mask = penalty_output_counts = None
         use_stats = self.penalty_stats is not None and not self.no_penalties
@@ -735,16 +811,25 @@ class InputBatch:
                                     self.num_prompt_tokens)
             penalty_prompt_mask, penalty_output_counts = self.penalty_stats.gather(req_indices)
         if not skip_copy:
-            async_h2d_update(self.temperature_cpu_tensor, self.temperature, req_indices)
-            async_h2d_update(self.top_p_cpu_tensor, self.top_p, req_indices)
-            async_h2d_update(self.top_k_cpu_tensor, self.top_k, req_indices)
+            async_h2d_update(self.temperature_cpu_tensor, self.temperature, req_indices, indices_device=idx)
+            async_h2d_update(self.top_p_cpu_tensor, self.top_p, req_indices, indices_device=idx)
+            async_h2d_update(self.top_k_cpu_tensor, self.top_k, req_indices, indices_device=idx)
             if not self.no_penalties:
                 # Since syncing these tensors is expensive only copy them
                 # if necessary i.e. if there are requests which require
                 # penalties to be applied during sampling.
-                async_h2d_update(self.frequency_penalties_cpu_tensor, self.frequency_penalties, req_indices)
-                async_h2d_update(self.presence_penalties_cpu_tensor, self.presence_penalties, req_indices)
-                async_h2d_update(self.repetition_penalties_cpu_tensor, self.repetition_penalties, req_indices)
+                async_h2d_update(self.frequency_penalties_cpu_tensor,
+                                 self.frequency_penalties,
+                                 req_indices,
+                                 indices_device=idx)
+                async_h2d_update(self.presence_penalties_cpu_tensor,
+                                 self.presence_penalties,
+                                 req_indices,
+                                 indices_device=idx)
+                async_h2d_update(self.repetition_penalties_cpu_tensor,
+                                 self.repetition_penalties,
+                                 req_indices,
+                                 indices_device=idx)
                 # The prompt tokens are used only for applying penalties during
                 # the sampling process. Hence copy these tensors only when
                 # there are requests which need penalties to be applied.
@@ -761,8 +846,11 @@ class InputBatch:
                 prompt_token_ids = None
 
         output_token_ids: list[list[int]] = []
-
-        for req_id, output_tokens in req_id_output_token_ids:
+        # Only penalty and bad-words rows read their outputs. The penalty tensor is padded to the longest list, and
+        # under async scheduling a row that decoded with no such consumer in the batch keeps a run of -1s as long as
+        # its output. Every other row gets an empty list: its penalties are neutral, so the result is the same.
+        # A thinking-token budget would read its rows' outputs too, if HPU ever supports it.
+        for (req_id, output_tokens), req_idx in zip(req_id_output_token_ids, req_indices):
             assert req_id is not None
             # Currently we create a tensor for output_token_ids from scratch
             # at each step. However, for the penalties computation what we
@@ -771,33 +859,49 @@ class InputBatch:
             # from scratch at each step.
             # TODO - Replace this with incremental update to output token
             # statistics.
-            output_token_ids.append(output_tokens)
+            if (req_id in self.frequency_penalties_reqs or req_id in self.presence_penalties_reqs
+                    or req_id in self.repetition_penalties_reqs or req_idx in self.bad_words_token_ids):
+                output_token_ids.append(output_tokens)
+            else:
+                output_token_ids.append([])
 
         allowed_token_ids_mask: Optional[torch.Tensor] = None
         if not self.no_allowed_token_ids:
             assert self.allowed_token_ids_mask is not None
             assert self.allowed_token_ids_mask_cpu_tensor is not None
-            async_h2d_update(self.allowed_token_ids_mask_cpu_tensor, self.allowed_token_ids_mask, req_indices)
-            allowed_token_ids_mask = self.allowed_token_ids_mask[gather]
+            async_h2d_update(self.allowed_token_ids_mask_cpu_tensor,
+                             self.allowed_token_ids_mask,
+                             req_indices,
+                             indices_device=idx)
+            allowed_token_ids_mask = self._select_rows(self.allowed_token_ids_mask, gather)
+        # Keyed by row in this selection. A padded selection repeats its first
+        # request, so only the first occurrence of each request gets an entry.
+        bad_words_token_ids: dict[int, list[list[int]]] = {}
+        if self.bad_words_token_ids:
+            seen: set[int] = set()
+            for i, req_idx in enumerate(req_indices):
+                if req_idx not in seen and req_idx in self.bad_words_token_ids:
+                    bad_words_token_ids[i] = self.bad_words_token_ids[req_idx]
+                seen.add(req_idx)
         return HpuSamplingMetadata(
-            temperature=self.temperature[gather],
+            temperature=self._select_rows(self.temperature, gather),
             all_greedy=self.all_greedy,
             all_random=self.all_random,
-            top_p=None if self.no_top_p else self.top_p[gather],
-            top_k=None if self.no_top_k else self.top_k[gather],
+            top_p=None if self.no_top_p else self._select_rows(self.top_p, gather),
+            top_k=None if self.no_top_k else self._select_rows(self.top_k, gather),
             generators={
                 i: self.generators[req_idx]
                 for i, req_idx in enumerate(req_indices) if self.generators.get(req_idx, None) is not None
             },
             max_num_logprobs=self.max_num_logprobs,
             prompt_token_ids=prompt_token_ids,
-            frequency_penalties=self.frequency_penalties[gather],
-            presence_penalties=self.presence_penalties[gather],
-            repetition_penalties=self.repetition_penalties[gather],
+            frequency_penalties=self._select_rows(self.frequency_penalties, gather),
+            presence_penalties=self._select_rows(self.presence_penalties, gather),
+            repetition_penalties=self._select_rows(self.repetition_penalties, gather),
             output_token_ids=cast(list[list[int]], output_token_ids),
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=allowed_token_ids_mask,
-            bad_words_token_ids=self.bad_words_token_ids,
+            bad_words_token_ids=bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             penalty_prompt_mask=penalty_prompt_mask,
             penalty_output_counts=penalty_output_counts,
@@ -810,12 +914,13 @@ class InputBatch:
     ) -> None:
         """Stash the prior step's sampled tokens for async penalty repair.
 
-        Ported from the identically named method in vLLM's GPU runner
-        (vllm/v1/worker/gpu_input_batch.py). Async scheduling copies the
-        sampled ids to CPU without a blocking sync; keep the CPU tensor and its
-        copy-ready event so update_async_output_token_ids can splice the real
-        ids in later. Cleared when no consumer reads output_token_ids (no
-        penalties and no bad_words), so the fast path skips the per-step sync.
+        Ported from the identically named method in vLLM's V1 GPU runner
+        (vendored as vllm_gaudi/v1/_vendored/worker/gpu_input_batch.py). Async
+        scheduling copies the sampled ids to CPU without a blocking sync; keep
+        the CPU tensor and its copy-ready event so update_async_output_token_ids
+        can splice the real ids in later. Cleared when no consumer reads
+        output_token_ids (no penalties and no bad_words), so the fast path skips
+        the per-step sync.
 
         Args:
             sampled_token_ids_cpu: prior step's sampled ids, shape (num_reqs, 1).
@@ -829,17 +934,27 @@ class InputBatch:
             self.sampled_token_ids_cpu = None
             self.async_copy_ready_event = None
 
-    def update_async_output_token_ids(self) -> None:
+    def update_async_output_token_ids(self, num_slots: Optional[Sequence[int]] = None) -> None:
         """Splice the prior step's real sampled ids over the -1 placeholders.
 
-        Ported from the identically named method in vLLM's GPU runner
-        (vllm/v1/worker/gpu_input_batch.py). Under async scheduling the runner
-        appends a -1 to each request's output_token_ids after sampling, because
-        the real id is still being copied to CPU. Called right before the
-        sampler reads output_token_ids for penalties: synchronize on the
-        copy-ready event and replace the placeholders. No-op when no consumer
-        reads output_token_ids (sampled_token_ids_cpu left None by
-        set_async_sampled_token_ids) or there is no prior step to repair.
+        num_slots: async speculative decoding, per row of the prior step: the
+        placeholders the scheduler counted for it (1 + its drafts), see
+        splice_placeholders.
+
+        Ported from the identically named method in vLLM's V1 GPU runner
+        (vendored as vllm_gaudi/v1/_vendored/worker/gpu_input_batch.py). Under
+        async scheduling the runner appends a -1 to each request's
+        output_token_ids after sampling, because the real id is still being
+        copied to CPU. Called right before the sampler reads output_token_ids
+        for penalties: synchronize on the copy-ready event and replace the
+        placeholders. No-op when no consumer reads output_token_ids
+        (sampled_token_ids_cpu left None by set_async_sampled_token_ids) or
+        there is no prior step to repair.
+
+        Only the newest placeholders are replaced: a request that decoded
+        while no consumer was in the batch keeps its older -1s, so its list
+        still matches its KV cache when it is re-added after a skipped step.
+        The penalty kernel maps -1 to its pad id.
         """
         if self.sampled_token_ids_cpu is None or self.prev_req_id_to_index is None:
             # Output token ids not needed or not async scheduling.
@@ -859,19 +974,8 @@ class InputBatch:
                 assert self.async_copy_ready_event is not None
                 self.async_copy_ready_event.synchronize()
                 sampled_token_ids = self.sampled_token_ids_cpu.tolist()
-            new_ids: list[int] = sampled_token_ids[prev_index]
-            if not new_ids:
-                continue
-            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
-            # Account for a differing number of placeholders vs sampled ids
-            # (tokens can be discarded after a kv-load failure).
-            first_placeholder = len(req_output_token_ids)
-            while (first_placeholder > 0 and req_output_token_ids[first_placeholder - 1] == -1):
-                first_placeholder -= 1
-            num_placeholders = len(req_output_token_ids) - first_placeholder
-            num_to_replace = min(num_sampled_ids, num_placeholders)
-            del new_ids[num_to_replace:]
-            req_output_token_ids[first_placeholder:] = new_ids
+            splice_placeholders(req_output_token_ids, sampled_token_ids[prev_index],
+                                None if num_slots is None else num_slots[prev_index])
 
     def get_pooling_params(self) -> list[PoolingParams]:
         assert len(self.req_ids) == len(self.pooling_params)

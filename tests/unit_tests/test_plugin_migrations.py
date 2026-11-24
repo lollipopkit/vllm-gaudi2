@@ -126,34 +126,63 @@ def test_v1_dflash_candidate_heads_patch() -> None:
     _patch_v1_dflash_candidate_heads()
     _patch_v1_dflash_candidate_heads()  # idempotent
 
-    dummy_cfg = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=1,
-            pipeline_parallel_size=1,
-            enable_batch_sharded_sampling=False,
+    # On vLLM >= 0.34, V1 feature gating moved to HpuPlatform._unsupported_engine_features.
+    spec_ok = SimpleNamespace(
+        method="dflash",
+        custom_method=None,
+        speculator_config=object(),
+        enable_adaptive_verification=False,
+        draft_lm_head_quantization=None,
+        draft_model_config=SimpleNamespace(
+            architectures=["DFlash2DraftModel"],
+            hf_config=SimpleNamespace(layer_types=["sliding_attention"]),
         ),
-        scheduler_config=SimpleNamespace(async_scheduling=False),
-        speculative_config=None,
-        model_config=None,
-        _dflash_needs_multi_kv_group=lambda: True,
-        _is_dflash_candidate_draft=lambda: True,
     )
+    cfg_ok = SimpleNamespace(
+        model_config=None,
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1, enable_batch_sharded_sampling=False),
+        speculative_config=spec_ok,
+    )
+    assert "DFlash candidate-head drafts" not in HpuPlatform._unsupported_engine_features(cfg_ok)
 
-    with patch("vllm.platforms.current_platform", HpuPlatform):
-        unsupported = VllmConfig._get_v1_model_runner_unsupported_features(dummy_cfg)
-    assert "DFlash candidate-head drafts" not in unsupported
-    assert "mixed sliding/full dflash drafts" in unsupported
+    spec_beam = SimpleNamespace(**{
+        **spec_ok.__dict__,
+        "draft_model_config": SimpleNamespace(
+            architectures=["DFlash2BeamDraftModel"],
+            hf_config=SimpleNamespace(layer_types=["sliding_attention"]),
+        ),
+    })
+    cfg_beam = SimpleNamespace(
+        model_config=None,
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1, enable_batch_sharded_sampling=False),
+        speculative_config=spec_beam,
+    )
+    assert "DFlash candidate-head drafts" in HpuPlatform._unsupported_engine_features(cfg_beam)
 
-    # Upstream Platform without supports_v1_dflash_candidate_heads attribute at all.
-    with patch("vllm.platforms.current_platform", SimpleNamespace()):
-        unsupported = VllmConfig._get_v1_model_runner_unsupported_features(dummy_cfg)
-    assert "DFlash candidate-head drafts" in unsupported
-    assert "mixed sliding/full dflash drafts" in unsupported
-
-    # Explicit False method.
-    with patch("vllm.platforms.current_platform", SimpleNamespace(supports_v1_dflash_candidate_heads=lambda: False)):
-        unsupported = VllmConfig._get_v1_model_runner_unsupported_features(dummy_cfg)
-    assert "DFlash candidate-head drafts" in unsupported
+    # Also verify legacy VllmConfig._get_v1_model_runner_unsupported_features hook when present.
+    if hasattr(VllmConfig, "_get_v1_model_runner_unsupported_features"):
+        dummy_cfg = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                pipeline_parallel_size=1,
+                enable_batch_sharded_sampling=False,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+            model_config=None,
+            _dflash_needs_multi_kv_group=lambda: True,
+            _is_dflash_candidate_draft=lambda: True,
+        )
+        with patch("vllm.platforms.current_platform", HpuPlatform):
+            unsupported = VllmConfig._get_v1_model_runner_unsupported_features(dummy_cfg)
+        assert "DFlash candidate-head drafts" not in unsupported
+        assert "mixed sliding/full dflash drafts" in unsupported
+        with patch("vllm.platforms.current_platform", SimpleNamespace()):
+            unsupported = VllmConfig._get_v1_model_runner_unsupported_features(dummy_cfg)
+        assert "DFlash candidate-head drafts" in unsupported
+        with patch("vllm.platforms.current_platform", SimpleNamespace(supports_v1_dflash_candidate_heads=lambda: False)):
+            unsupported = VllmConfig._get_v1_model_runner_unsupported_features(dummy_cfg)
+        assert "DFlash candidate-head drafts" in unsupported
 
 
 def test_model_registry_lfm3_and_inkling2() -> None:

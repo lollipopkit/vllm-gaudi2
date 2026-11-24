@@ -17,6 +17,8 @@ def _runner(use_contiguous_pa=False, max_model_len=131072):
                              use_contiguous_pa=use_contiguous_pa,
                              max_model_len=max_model_len,
                              attn_block_size=128,
+                             _num_attn_blocks=0,
+                             is_kimi_k3=False,
                              interleaved_sliding_window=False,
                              kv_cache_config=SimpleNamespace(num_blocks=1 << 20))
     # The real methods; they also call each other through self.
@@ -32,7 +34,7 @@ def _scenario_blocks(runner, batch_size, num_blocks, longest=None):
     # Context tokens plus the token being decoded.
     runner._add_dummy_request = lambda requests, scheduled, num_computed_tokens, **_: requests.append(
         cdiv(num_computed_tokens + 1, runner.attn_block_size))
-    runner._execute_dummy_scenario = lambda requests, scheduled: built.extend(requests)
+    runner._execute_dummy_scenario = lambda requests, scheduled, spec_decode_tokens=None: built.extend(requests)
     runner._prepare_dummy_scenario(None, (batch_size, 1, num_blocks), decode_longest_blocks=longest)
     return built
 

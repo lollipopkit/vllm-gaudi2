@@ -13,6 +13,7 @@ import torch
 from vllm.v1.attention.backend import AttentionMetadata, AttentionImpl
 from vllm_gaudi.attention.backends.hpu_attn import (HPUAttentionBackend, HPUAttentionImpl, HPUAttentionMetadata)
 from vllm_gaudi.extension.logger import logger as init_logger
+from vllm_gaudi.extension.runtime import get_config
 from vllm.v1.attention.backends.registry import (register_backend, AttentionBackendEnum)
 
 logger = init_logger()
@@ -39,6 +40,14 @@ class HPUAttentionBackendV1(HPUAttentionBackend):
         # kernel block size; 528 is required for Granite 4.0-H
         # (granitemoehybrid) without prefix caching (16-token FA alignment),
         # 768 with prefix caching (chunk-aligned).
+        # vLLM picks the largest listed size that divides the KV-manager block,
+        # e.g. 528 for the 4224-token page of Nemotron-H on 4 cards. With such
+        # large kernel blocks, exact copies from the context (long numbers,
+        # UUIDs) go wrong more often, so models with prefer_128_kernel_blocks
+        # keep 128 whenever it divides the block.
+        if (kv_cache_spec is not None and kv_cache_spec.block_size % 128 == 0
+                and get_config().prefer_128_kernel_blocks):
+            return [128]
         return [16, 128, 528, 768]
 
     @classmethod
@@ -64,6 +73,14 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     blocks_caching_range: Optional[torch.Tensor] = None
     mamba_chunks_to_block_mapping: Optional[torch.Tensor] = None
     seqlens_offsets_for_blocks: Optional[torch.Tensor] = None
+    # Mamba2 decode with speculative decoding (see HPUMambaMixer2): per cache
+    # group, the slot holding the state after the previous step's last
+    # accepted token [num_groups, batch], the slots receiving the state after
+    # each query token [num_groups, batch, num_tokens], and the conv window
+    # offset of the live history [batch]. None unless speculative decoding.
+    mamba_spec_load_indices: Optional[torch.Tensor] = None
+    mamba_spec_store_indices: Optional[torch.Tensor] = None
+    mamba_spec_conv_offsets: Optional[torch.Tensor] = None
     window_block_list: Optional[torch.Tensor] = None
     image_seg_ids: Optional[torch.Tensor] = None
     indexer_block_index: Optional[torch.Tensor] = None
@@ -144,7 +161,10 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              indexer_block_index=None,
                              direct_gdn_state=False,
                              gdn_num_accepted=None,
-                             block_logical_idx=None):
+                             block_logical_idx=None,
+                             mamba_spec_load_indices=None,
+                             mamba_spec_store_indices=None,
+                             mamba_spec_conv_offsets=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -171,4 +191,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    indexer_block_index=indexer_block_index,
                    direct_gdn_state=direct_gdn_state,
                    gdn_num_accepted=gdn_num_accepted,
-                   block_logical_idx=block_logical_idx)
+                   block_logical_idx=block_logical_idx,
+                   mamba_spec_load_indices=mamba_spec_load_indices,
+                   mamba_spec_store_indices=mamba_spec_store_indices,
+                   mamba_spec_conv_offsets=mamba_spec_conv_offsets)

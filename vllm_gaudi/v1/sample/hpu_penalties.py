@@ -14,8 +14,8 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
+from vllm_gaudi.v1._vendored.sample.metadata import SamplingMetadata
+from vllm_gaudi.v1._vendored.sample.sampler import Sampler
 
 from vllm_gaudi.utils import async_h2d_copy
 

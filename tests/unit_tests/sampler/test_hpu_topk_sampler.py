@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+from vllm_gaudi.v1._vendored.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm_gaudi.ops import hpu_sampler
 
 
