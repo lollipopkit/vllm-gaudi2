@@ -1,100 +1,94 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png" alt="vLLM" width="30%">
-  <span style="font-size: 24px; font-weight: bold;">x</span>
-  <img src="./docs/assets/logos/gaudi-logo.png" alt="Intel-Gaudi" width="30%">
-</p>
+# vllm-gaudi2
 
-<h2 align="center">
-vLLM Hardware Plugin for Intel® Gaudi®
-</h2>
+Optimized vLLM hardware plugin for **Intel Gaudi2 (`HL-225`, 96 GiB HBM2e, 2.45 TB/s)**, based on [`vllm-project/vllm-gaudi`](https://github.com/vllm-project/vllm-gaudi) (`@827b0092`) with **zero modifications required to upstream [`vllm`](https://github.com/vllm-project/vllm)**.
 
-<p align="center">
-| <a href="https://vllm-gaudi.readthedocs.io/en/latest/index.html"><b>Documentation</b></a> | <a href="https://docs.habana.ai/en/latest/index.html"><b>Intel® Gaudi® Documentation</b></a> | <a href="https://docs.habana.ai/en/latest/PyTorch/Model_Optimization_PyTorch/Optimization_in_Training_Platform.html"><b>Optimizing Training Platform Guide</b></a> |
-</p>
+Targets **Gaudi2 only** (not tested on Gaudi1 or Gaudi3). The Python package name remains `vllm_gaudi` for vLLM plugin discovery and upstream compatibility.
 
-<p align="center">
-  <a href="https://scorecard.dev/viewer/?uri=github.com/vllm-project/vllm-gaudi"><img src="https://api.scorecard.dev/projects/github.com/vllm-project/vllm-gaudi/badge" alt="OpenSSF Scorecard"></a>
-</p>
+> **Testbed & 350 W Power Cap**: All benchmarks below were measured on a single `HL-225` (PCIe Gen3 x16) **hard-capped at 350 W** (stock TDP: 600 W; compute-bound stages such as prefill and high-concurrency decode run power-limited), Ubuntu 24.04, SynapseAI 1.24.2, PyTorch 2.9+hpu.
 
----
-*Latest News* 🔥
-- [2026/08] Version 0.26.0 is now available, built on [vLLM 0.26.0](https://github.com/vllm-project/vllm/releases/tag/v0.26.0) and fully compatible with [Intel® Gaudi® v1.24.1](https://docs.habana.ai/en/v1.24.1/Release_Notes/GAUDI_Release_Notes.html) with PyTorch 2.11.
+## Benchmarks (1× HL-225, **350 W cap**)
 
-  This release enables the plugin on upstream vLLM 0.26.0 and realigns the Intel® Gaudi® platform with extensive upstream API drift across MoE/MLA, quantization, serving, attention, and the NIXL connector. It adds new model support for MiniMax-M3, the Gemma-4 family, the Kimi-K2.5 vision tower, and Qwen3-Coder-Next, improves MXFP4 gpt-oss serving and FP8/INC quantization stability, reduces graph compilation and warmup overhead, and strengthens security.
+| Model | Precision | Performance | Quality / Key Optimizations |
+|---|---|---|---|
+| **Inkling 2 Mini** (26.4B Looped MoE + 23-layer ViT) | FP8 (`inkling2_fp8`) | `133.5 tok/s` (`7.49 ms`, `c=1`) · `315.4` (`c=4`) · `480.9` (`c=8`) · `436.6` (`c=8` diverse) | `25.55 GiB` HBM, 17 custom TPC-C kernels, 6-layer decode groups, native FP8→FP32 `lm_head` |
+| **Qwen3.8-27B** (48 GDN + 16 GQA) | FP8 + FP8 KV | `63.7 tok/s` (`15.70 ms`, `b=1`, +90% vs upstream) · `242` out / `2,248` total (`c=8`) | GSM8K `95.3%`, NLL `+0.0012` vs BF16, custom GDN TPC kernels, FlashQLA prefill, MTP / DFlash2 |
+| **LiquidAI LFM3** (`1.7B` / `VL-2B` / `Omni-2B`) | FP8 (`e4m3fn`) | `217.7 tok/s` (`b=1`) · `1,449` (`b=8`) · `2,467` out / `7,352+` total (`c=32` Omni) | GSM8K `76.7%`, MMStar `74.4%`, LibriSpeech WER `2.62%`, `HPUShortConv`, packed vision tower |
 
-- [2026/07] Version 0.24.0 is now available, built on [vLLM 0.24.0](https://github.com/vllm-project/vllm/releases/tag/v0.24.0) and fully compatible with [Intel® Gaudi® v1.24.1](https://docs.habana.ai/en/v1.24.1/Release_Notes/GAUDI_Release_Notes.html) with PyTorch 2.11.
+## Additions Over Upstream `vllm-gaudi`
 
-  This release enables the plugin on upstream vLLM 0.24.0 and adapts the Intel® Gaudi® platform to upstream changes, including the FusedMoE/MoERunner inversion, KV-connector and offloading refactors, and the Mamba/GDN rewrite. It also adds Qwen3-Next architecture support, improves FP8/INC quantization memory usage and stability, switches hybrid models to a TPC-native `causal_conv1d` update path, extends single-card model swapping to hybrid models, and strengthens security.
+- **19 Custom Gaudi2 TPC-C Kernels ([`tpc/`](tpc/))**: `gdn_decode` / `gdn_verify` for Qwen3.8 plus 17 Inkling2 decode kernels (MoE gate/grouping/FP8 GEMV, paged relative-bias attention, Block AttnRes, short-conv), bundled with stock `libtpc_kernels.so` inside single-file `libgaudi2_tpc_proxy.so` (preserves Synapse recipe cache), PyTorch C++ ops (`tpc/torch/`), and simulator test suites (`tpc/tests/`).
+- **Out-of-Tree Model Plugins (`vllm_gaudi/models/`)**: Full HPU backends for Inkling 2 Mini (`inkling2/`), LiquidAI LFM3 / VL / Omni (`lfm3*.py`), and DFlash2 (`qwen3_dflash2.py`), registered through vLLM plugin entry points and guarded runtime hooks (`vllm_gaudi/patches.py`).
+- **Decode & Runtime Optimizations**: Multi-layer compiled decode groups (`layer_groups.py`), FlashQLA GDN prefill (`flashinfer_gaudi/`), native FP8→FP32 `lm_head` (`VLLM_HPU_FP8_LM_HEAD=1`), `int32` paged-attention indices, symbolic `fp8_gemm_v2` meta shapes, and zero-redundant-DMA decode (`13 → 4` H2D DMAs/step).
+- **Offline Weight Converter ([`tools/convert_inkling2_fp8.py`](tools/convert_inkling2_fp8.py))**: Streams Inkling 2 Mini NVFP4/MXFP8 routed experts to per-channel Gaudi2 FP8 (`max=240.0`).
 
-- [2026/04] Version 0.19.0 is now available, built on [vLLM 0.19.0](https://github.com/vllm-project/vllm/releases/tag/v0.19.0) and fully compatible with [Intel® Gaudi® v1.24.0](https://docs.habana.ai/en/v1.24.0/Release_Notes/GAUDI_Release_Notes.html) with PyTorch 2.10.
+## Installation
 
-  This release upgrades the platform to Intel® Gaudi® Software v1.24.0 with PyTorch 2.10. It introduces Qwen 3.5 model support, Mamba prefix caching for hybrid models, MxFP4 weight dequantization, LMCache integration, and a custom depthwise conv1d TPC kernel for MambaMixer2. Performance improvements include torch.compile-compatible online defragmentation, improved warmup time, and optimized hybrid KV cache visibility.
+Install unmodified upstream `vllm` at the verified commit (`a0544b13f`), then install this plugin:
 
-- [2026/04] Version 0.17.1 is now available, built on [vLLM 0.17.1](https://github.com/vllm-project/vllm/releases/tag/v0.17.1) and fully compatible with [Intel® Gaudi® v1.23.0](https://docs.habana.ai/en/v1.23.0/Release_Notes/GAUDI_Release_Notes.html).
+```bash
+# 1. Upstream vLLM (empty target, reusing Habana PyTorch)
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+git checkout a0544b13f2ee6424d3aa6d03a00e1c745218dee9
+pip install -r <(sed '/^torch/d' requirements/build/cuda.txt)
+VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e .
+cd ..
 
-  This patch release backports critical fixes and improvements including MxFP4 weight loading, Granite 4.0-h calibration, prefix caching for HPUMambaMixer2, OOM crash fixes, and SDL secure error handling improvements.
+# 2. This plugin
+git clone git@github.com:lollipopkit/vllm-gaudi2.git
+cd vllm-gaudi2
+pip install --no-build-isolation -e .
 
----
+# 3. Optional: build custom Gaudi2 TPC-C kernels & PyTorch custom ops (requires habanatools)
+cmake -S tpc -B tpc/build && make -C tpc/build -j
+(cd tpc/torch && python setup.py build_ext --inplace)
+```
 
-## About
+## Quick Start
 
-The vLLM Hardware Plugin for Intel® Gaudi® integrates [Intel® Gaudi® AI accelerators](https://docs.habana.ai/en/latest/index.html) with [vLLM](https://docs.vllm.ai/en/latest/) to optimize large language model inference. It follows the [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162) and [[RFC]: Enhancing vLLM Plugin Architecture](https://github.com/vllm-project/vllm/issues/19161) principles, providing a modular interface for Intel® Gaudi® hardware. For more information, see the [Plugin System](https://vllm-gaudi.readthedocs.io/en/latest/dev_guide/plugin_system.html) document.
+```bash
+# Qwen3.8-27B-FP8 (with custom GDN TPC kernel)
+VLLM_HPU_GDN_TPC_DECODE=1 \
+GC_KERNEL_PATH=$PWD/tpc/build/libgaudi2_tpc_proxy.so \
+vllm serve /models/Qwen3.8-27B-FP8 --port 8000
 
-## Getting Started
+# LiquidAI LFM3-1.7B / VL-2B / Omni-2B
+vllm serve /models/LFM3-1.7B-FP8 --trust-remote-code --port 8001
 
-1. [Set up](https://docs.habana.ai/en/latest/Installation_Guide/index.html) your execution environment. Additionally, to achieve the best performance on HPU, follow the methods outlined in the [Optimizing Training Platform Guide](https://docs.habana.ai/en/latest/PyTorch/Model_Optimization_PyTorch/Optimization_in_Training_Platform.html).
+# Thinking Machines Inkling 2 Mini (convert NVFP4/MXFP8 -> Gaudi2 FP8 once)
+python tools/convert_inkling2_fp8.py /models/Inkling-2-Mini /models/Inkling-2-Mini-FP8
+VLLM_HPU_FP8_LM_HEAD=1 INKLING2_FP8_ATTN=1 INKLING2_COMPILE_GROUP_SIZE=6 \
+GC_KERNEL_PATH=$PWD/tpc/build/libgaudi2_tpc_proxy.so \
+vllm serve /models/Inkling-2-Mini-FP8 --no-enable-prefix-caching --port 8002
+```
 
-2. Get the last verified vLLM commit. While vLLM Hardware Plugin for Intel® Gaudi® follows the latest vLLM commits, upstream API updates may introduce compatibility issues. The saved commit has been thoroughly validated.
+## Key Environment Variables
 
-    ```bash
-    git clone https://github.com/vllm-project/vllm-gaudi
-    cd vllm-gaudi
-    export VLLM_COMMIT_HASH=$(git show "origin/vllm/last-good-commit-for-vllm-gaudi:VLLM_STABLE_COMMIT" 2>/dev/null)
-    cd ..
-    ```
+| Variable | Default | Purpose |
+|---|---|---|
+| `GC_KERNEL_PATH` | stock | Point to `tpc/build/libgaudi2_tpc_proxy.so` to enable custom TPC kernels with recipe caching |
+| `VLLM_HPU_FP8_LM_HEAD` | `0` | Quantize `lm_head` to per-channel FP8 post-load (supports direct FP8→FP32 logits) |
+| `VLLM_HPU_GDN_TPC_DECODE` | `0` | Enable custom `gdn_decode` / `gdn_verify` TPC kernels for Qwen3.8 |
+| `INKLING2_FP8_ATTN` | `1` | Quantize Inkling2 attention `qkvr` / `wo_ud` projections to FP8 at load time |
+| `INKLING2_COMPILE_GROUP_SIZE` | `6` | Static decode layer group size for Inkling2 (8 groups across 48 visits) |
+| `VLLM_FULL_WARMUP` | `0` | Warm all buckets then disable Dynamo guard checks during decode |
 
-3. Install vLLM using `pip` or [build it from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source):
+See [`docs/configuration/env_variables.md`](docs/configuration/env_variables.md) for all upstream `vllm_gaudi` flags.
 
-    ```bash
-    # Build vLLM from source for empty platform, reusing existing torch installation
-    git clone https://github.com/vllm-project/vllm
-    cd vllm
-    git checkout $VLLM_COMMIT_HASH
-    pip install -r <(sed '/^torch/d' requirements/build/cuda.txt)
-    VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e .
-    cd ..
-    ```
+## Tests
 
-4. Install vLLM Hardware Plugin for Intel® Gaudi® from source:
+```bash
+# Python unit tests
+pytest -q tests/unit_tests/test_plugin_migrations.py tests/unit_tests/test_hpu_lfm3_vl_tower.py \
+  tests/unit_tests/spec_decode/test_hpu_dflash.py tools/test_convert_inkling2_fp8.py tools/test_inkling2_hpu_ops.py
 
-    ```bash
-    cd vllm-gaudi
-    pip install -e .
-    cd ..
-    ```
+# Gaudi2 TPC simulator suites (requires habanatools)
+LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/gdn_decode_test 6 2
+LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/inkling2_attn_res_test
+LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/inkling2_ops_test
+LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/inkling2_moe_test
+```
 
-5. Install torchaudio (required by some upstream vLLM models such as QWEN3_5). Use the CPU wheel with `--no-deps` to avoid pulling a conflicting CUDA torch. torchaudio has no release past 2.11.0, so install 2.11.0 instead of matching your PyTorch version:
+## License
 
-    ```bash
-    pip install --no-deps torchaudio==2.11.0 --extra-index-url https://download.pytorch.org/whl/cpu
-    ```
-
-    To see all the available installation methods, such as NIXL, see the [Installation](https://vllm-gaudi.readthedocs.io/en/latest/getting_started/installation.html) guide.
-
-## Distributed Executor Backend and Worker Start Method
-
-On HPU, multi-card serving uses vLLM's `mp`, the Python multiprocessing distributed executor backend, by default whenever `world_size > 1`, that is, `TP * PP * DP > 1`. When `world_size == 1`, vLLM uses the in-process `uni` backend.
-
-The worker start method is controlled by `VLLM_WORKER_MULTIPROC_METHOD`, with `fork` or `spawn` as the available options. Upstream vLLM defaults to `fork`; however, on HPU, the platform layer automatically overrides it to `spawn` because forking after HPU driver initialization leaves driver state in child processes and can cause hangs on exit. A warning is logged when the override is applied. To opt out, set `VLLM_WORKER_MULTIPROC_METHOD=fork` explicitly, although this is not recommended. The `uni`, `external_launcher`, and `ray` backends do not start workers via Python `multiprocessing`, so the value has no practical effect for them.
-
-For more information, see [docs/configuration/env_variables.md](docs/configuration/env_variables.md#distributed-executor-backend-on-hpu).
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm-gaudi/issues).
-<!-- --8<-- [end:contact-us] -->
+Licensed under [Apache-2.0](LICENSE). See [`NOTICE`](NOTICE) for third-party attributions (`vllm-project/vllm-gaudi`, `1Cat-vLLM-Gaudi`, and Habana Labs BSD-2-Clause TPC test helpers).
