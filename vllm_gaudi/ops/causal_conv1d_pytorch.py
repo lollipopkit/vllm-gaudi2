@@ -282,6 +282,43 @@ def hpu_causal_conv1d_fn(
             # row 0 remains a valid incoming state.
             keep_initial_state = keep_initial_state & (read_idx_prefill.reshape(-1) != 0)
 
+    # Token-major batched path: callers pass ``x`` as the channel-last view of a
+    # [T, dim] activation (``mixed_qkv.transpose(0, 1)``).  Convolving along the
+    # token rows needs no layout change of x, the conv states or the output; the
+    # (dim, B, L) path below costs two full DMA transposes per layer.
+    if x_work.stride(0) == 1 and dim > 1 and padded_batch > 0 and cu_seqlen % padded_batch == 0:
+        seq_len_each = cu_seqlen // padded_batch
+        x_tok = x_work.t().reshape(padded_batch, seq_len_each, dim)
+
+        if has_initial_state is not None:
+            raw_states = conv_states.index_select(0, safe_read_idx_prefill)[:, -state_len:, :]
+            assert keep_initial_state is not None
+            init_states = torch.where(keep_initial_state.reshape(-1, 1, 1), raw_states, torch.zeros_like(raw_states))
+        else:
+            init_states = torch.zeros(padded_batch, state_len, dim, device=x_work.device, dtype=work_dtype)
+        seq_input = torch.cat([init_states, x_tok], dim=1)  # (B, state_len + L, dim)
+
+        # New states come from the actual end of each sequence (see below).
+        actual_qlens = (qsl[1:padded_batch + 1] - qsl[:padded_batch]).clamp(min=0)
+        row_indices = (actual_qlens.unsqueeze(-1).to(torch.int64) +
+                       torch.arange(state_len, device=x_work.device, dtype=torch.int64).unsqueeze(0))
+        new_states = torch.gather(seq_input, 1, row_indices.unsqueeze(-1).expand(-1, -1, dim))
+
+        seq_out_tok = torch.zeros(padded_batch, seq_len_each, dim, device=x_work.device, dtype=work_dtype)
+        for k in range(width):
+            seq_out_tok = seq_out_tok + seq_input[:, k:k + seq_len_each, :] * weight_work[:, k]
+        if bias_work is not None:
+            seq_out_tok = seq_out_tok + bias_work
+
+        with torch.no_grad():
+            update_mask = (actual_qlens > 0).view(-1, 1, 1)
+            existing_states = conv_states.index_select(0, safe_cache_idx_prefill)[:, -state_len:, :]
+            conv_states[safe_cache_idx_prefill, -state_len:, :] = torch.where(update_mask, new_states,
+                                                                              existing_states)
+
+        seq_out_tok = _apply_activation(seq_out_tok.reshape(cu_seqlen, dim), activation)
+        return seq_out_tok.to(original_dtype).t()
+
     # Batched path — HPU bucketed prefill pads all sequences to the same
     # length, so we can reshape to (B, dim, L) and process all sequences in
     # one shot without any device-to-host syncs.

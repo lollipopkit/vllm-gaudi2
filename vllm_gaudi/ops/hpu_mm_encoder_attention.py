@@ -40,6 +40,9 @@ class HpuMMEncoderAttention(MMEncoderAttention):
 
             HPUFusedSDPA = kernels.fsdpa()
             fsdpa_op = ModuleFusedSDPA(HPUFusedSDPA)
+            # Same rule as the prompt attention (extension/ops.py): models that need an fp32 softmax there
+            # need it in their vision encoder too (LFM3-VL: half the prompt-logprob deviation, docs/lfm3.md).
+            softmax_mode = 'fp32' if get_config().fp32_softmax else 'fast'
 
             if cu_seqlens is None:
                 out = fsdpa_op(query,
@@ -49,7 +52,7 @@ class HpuMMEncoderAttention(MMEncoderAttention):
                                dropout_p=0.0,
                                is_causal=False,
                                scale=self.scale,
-                               softmax_mode="fast",
+                               softmax_mode=softmax_mode,
                                recompute_mode=True,
                                valid_sequence_lengths=None)
             else:
@@ -73,7 +76,7 @@ class HpuMMEncoderAttention(MMEncoderAttention):
                                         dropout_p=0.0,
                                         is_causal=False,
                                         scale=self.scale,
-                                        softmax_mode="fast",
+                                        softmax_mode=softmax_mode,
                                         recompute_mode=True,
                                         valid_sequence_lengths=None)
                     outputs.append(output_i)

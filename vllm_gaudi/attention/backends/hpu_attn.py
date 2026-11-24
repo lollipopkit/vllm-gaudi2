@@ -159,6 +159,11 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     last_chunk_indices_p: Optional[torch.Tensor] = None
     load_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
     store_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
+    # Decode only: request i owns row i of every compact GDN group, so GDN
+    # layers may use contiguous state views (see HPUModelRunner).
+    direct_gdn_state: bool = False
+    # Spec decode: per-request accepted count of the previous step (1..1+k); GDN reads state row a - 1.
+    gdn_num_accepted: Optional[torch.Tensor] = None  # shape: [batch,]
 
 
 @dataclass

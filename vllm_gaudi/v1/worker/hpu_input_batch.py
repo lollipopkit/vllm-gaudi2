@@ -22,6 +22,7 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.sample.logits_processor import (BatchUpdateBuilder, LogitsProcessors)
 
 from vllm_gaudi.utils import async_h2d_copy, async_h2d_update
+from vllm_gaudi.v1.sample.hpu_penalties import HpuPenaltyStats, HpuSamplingMetadata
 
 _SAMPLING_EPS = 1e-5
 
@@ -131,6 +132,7 @@ class InputBatch:
         logitsprocs: Optional[LogitsProcessors] = None,
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
+        max_num_blocks: Optional[list[int]] = None,  # per group; default cdiv(max_model_len, block_size)
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -140,6 +142,9 @@ class InputBatch:
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
+        # Device-side penalty statistics; spec decode keeps vLLM's path (its draft tokens are not counted here)
+        self.penalty_stats = (None if is_spec_decode or is_pooling_model else HpuPenaltyStats(
+            max_num_reqs, vocab_size, device))
 
         self._req_ids: list[Optional[str]] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -172,7 +177,8 @@ class InputBatch:
         # requires the caller to pass the per-group block count. HPU does not
         # use DCP (cp_world_size == 1), so max_num_blocks reduces to
         # cdiv(max_model_len, block_size) per KV cache group.
-        max_num_blocks = [cdiv(max_model_len, block_size) for block_size in block_sizes]
+        if max_num_blocks is None:
+            max_num_blocks = [cdiv(max_model_len, block_size) for block_size in block_sizes]
         self.block_table = HPUMultiGroupBlockTable(max_num_reqs=max_num_reqs,
                                                    max_num_batched_tokens=max_num_batched_tokens,
                                                    pin_memory=pin_memory,
@@ -315,6 +321,8 @@ class InputBatch:
             self.req_output_token_ids[req_index] = request.output_token_ids
 
         self.req_id_to_index[req_id] = req_index
+        if self.penalty_stats is not None:
+            self.penalty_stats.reset(req_index)
 
         # Copy the prompt token ids and output token ids.
         num_prompt_tokens = len(request.prompt_token_ids)
@@ -514,6 +522,8 @@ class InputBatch:
         tmp = self.token_ids_cpu[i1, ...].copy()
         self.token_ids_cpu[i1, ...] = self.token_ids_cpu[i2, ...]
         self.token_ids_cpu[i2, ...] = tmp
+        if self.penalty_stats is not None:
+            self.penalty_stats.swap(i1, i2)
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
@@ -565,6 +575,8 @@ class InputBatch:
 
             num_tokens = self.num_tokens[last_req_index]
             self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[last_req_index, :num_tokens]
+            if self.penalty_stats is not None:
+                self.penalty_stats.move(last_req_index, empty_index)
             self.num_tokens[empty_index] = num_tokens
             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[last_req_index]
             self.num_prompt_tokens[empty_index] = self.num_prompt_tokens[last_req_index]
@@ -636,9 +648,13 @@ class InputBatch:
 
             # The prompt tokens are used only for applying penalties during
             # the sampling process. Hence copy these tensors only when
-            # there are requests which need penalties to be applied.
-            prompt_token_ids_cpu = self._make_prompt_token_ids_cpu_tensor()
-            prompt_token_ids = prompt_token_ids_cpu.to(device=self.device, non_blocking=True)
+            # there are requests which need penalties to be applied
+            # (the device-side penalty statistics replace them).
+            if self.penalty_stats is None:
+                prompt_token_ids_cpu = self._make_prompt_token_ids_cpu_tensor()
+                prompt_token_ids = prompt_token_ids_cpu.to(device=self.device, non_blocking=True)
+            else:
+                prompt_token_ids_cpu = prompt_token_ids = None
         else:
             prompt_token_ids_cpu = None
             prompt_token_ids = None
@@ -684,13 +700,40 @@ class InputBatch:
         if hasattr(self, '_prompt_token_ids_cache'):
             self._prompt_token_ids_cache = None
 
+    def _sampling_gather_index(self, req_indices: list[int]) -> slice | torch.Tensor:
+        n = len(req_indices)
+        if req_indices == list(range(n)):
+            return slice(0, n)
+        cache = getattr(self, '_sampling_gather_cache', None)
+        if cache is None:
+            cache = {}
+            self._sampling_gather_cache = cache
+        key = tuple(req_indices)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        index_cpu = torch.tensor(req_indices, dtype=torch.int64, device="cpu", pin_memory=self.pin_memory)
+        res = index_cpu.to(device=self.device, non_blocking=True)
+        cache[key] = res
+        return res
+
     def make_selective_sampling_metadata(
         self,
         req_id_output_token_ids: list[tuple[str, list[int]]],
         skip_copy: bool = False,
     ) -> SamplingMetadata:
         req_indices: list[int] = [self.req_id_to_index[req_id] for req_id, _ in req_id_output_token_ids]
+        # One gather index for every per-request device tensor below. Indexing an HPU tensor with a
+        # python list builds a fresh index tensor and copies it synchronously each time; decode
+        # batches are usually rows 0..n-1, which a slice view serves with no copy at all.
+        gather = self._sampling_gather_index(req_indices)
         prompt_token_ids = None
+        penalty_prompt_mask = penalty_output_counts = None
+        use_stats = self.penalty_stats is not None and not self.no_penalties
+        if use_stats:
+            self.penalty_stats.sync(req_indices, [out for _, out in req_id_output_token_ids], self.token_ids_cpu,
+                                    self.num_prompt_tokens)
+            penalty_prompt_mask, penalty_output_counts = self.penalty_stats.gather(req_indices)
         if not skip_copy:
             async_h2d_update(self.temperature_cpu_tensor, self.temperature, req_indices)
             async_h2d_update(self.top_p_cpu_tensor, self.top_p, req_indices)
@@ -705,11 +748,12 @@ class InputBatch:
                 # The prompt tokens are used only for applying penalties during
                 # the sampling process. Hence copy these tensors only when
                 # there are requests which need penalties to be applied.
-                prompt_token_ids = self._make_prompt_token_ids_cpu_tensor()[req_indices].to(device=self.device,
-                                                                                            non_blocking=True)
+                if not use_stats:
+                    prompt_token_ids = self._make_prompt_token_ids_cpu_tensor()[req_indices].to(device=self.device,
+                                                                                                non_blocking=True)
         else:
             # Even with skip_copy=True, we need prompt_token_ids for penalties
-            if not self.no_penalties:
+            if not self.no_penalties and not use_stats:
                 cached_tensor = self._get_cached_prompt_token_ids()
                 prompt_token_ids = cached_tensor[req_indices].to(
                     device=self.device, non_blocking=True) if cached_tensor is not None else None
@@ -734,27 +778,29 @@ class InputBatch:
             assert self.allowed_token_ids_mask is not None
             assert self.allowed_token_ids_mask_cpu_tensor is not None
             async_h2d_update(self.allowed_token_ids_mask_cpu_tensor, self.allowed_token_ids_mask, req_indices)
-            allowed_token_ids_mask = self.allowed_token_ids_mask[req_indices]
-        return SamplingMetadata(
-            temperature=self.temperature[req_indices],
+            allowed_token_ids_mask = self.allowed_token_ids_mask[gather]
+        return HpuSamplingMetadata(
+            temperature=self.temperature[gather],
             all_greedy=self.all_greedy,
             all_random=self.all_random,
-            top_p=None if self.no_top_p else self.top_p[req_indices],
-            top_k=None if self.no_top_k else self.top_k[req_indices],
+            top_p=None if self.no_top_p else self.top_p[gather],
+            top_k=None if self.no_top_k else self.top_k[gather],
             generators={
                 i: self.generators[req_idx]
                 for i, req_idx in enumerate(req_indices) if self.generators.get(req_idx, None) is not None
             },
             max_num_logprobs=self.max_num_logprobs,
             prompt_token_ids=prompt_token_ids,
-            frequency_penalties=self.frequency_penalties[req_indices],
-            presence_penalties=self.presence_penalties[req_indices],
-            repetition_penalties=self.repetition_penalties[req_indices],
+            frequency_penalties=self.frequency_penalties[gather],
+            presence_penalties=self.presence_penalties[gather],
+            repetition_penalties=self.repetition_penalties[gather],
             output_token_ids=cast(list[list[int]], output_token_ids),
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
+            penalty_prompt_mask=penalty_prompt_mask,
+            penalty_output_counts=penalty_output_counts,
         )
 
     def set_async_sampled_token_ids(

@@ -64,7 +64,7 @@ class HpuPlatform(Platform):
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
     supported_quantization: list[str] = [
-        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4"
+        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4", "inkling2_fp8"
     ]
     simple_compile_backend = "hpu_backend"
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
@@ -280,9 +280,10 @@ class HpuPlatform(Platform):
         os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
         # NOTE: vLLM has default enabled async scheduling with speculative decoding is on.
-        # However, for HPU, speculative decoding is not supported with async scheduling.
+        # On HPU only DFlash supports it (drafting deferred to the next step, see HPUModelRunner).
+        spec_config = vllm_config.speculative_config
         vllm_config.scheduler_config.async_scheduling = \
-            vllm_config.scheduler_config.async_scheduling and vllm_config.speculative_config is None
+            vllm_config.scheduler_config.async_scheduling and (spec_config is None or spec_config.use_dflash())
 
         cls._maybe_disable_chunked_mm_input(vllm_config)
 
@@ -424,6 +425,11 @@ class HpuPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_v1_dflash_candidate_heads(cls) -> bool:
+        # HpuDFlashProposer runs the candidate walk (vllm_gaudi/v1/spec_decode/hpu_dflash.py).
         return True
 
     @classmethod

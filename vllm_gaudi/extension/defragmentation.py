@@ -61,7 +61,9 @@ class OnlineDefragmenter:
         self.graphed = with_default(config.VLLM_DEFRAG_WITH_GRAPHS, config.bridge_mode == 'eager')
         self.debug = init_debug_logger('defrag')
         self.kv_caches = tuple(kv_caches)
-        self.is_mla = all([cache[1] is None for cache in self.kv_caches])
+        # A layer's entry is (key, value, ...) for attention, (state, ...) for mamba-like layers;
+        # single-state layers (LFM short conv) have no value entry.
+        self.is_mla = all(len(cache) > 1 and cache[1] is None for cache in self.kv_caches)
         self.block_size = block_size
         self.cache_utils = CacheSwapUtils(block_size, kv_caches[0][0].device)
         if self.graphed:
@@ -112,6 +114,8 @@ class OnlineDefragmenter:
 
     def resolve_all(self, block_table_list: list[list[int]]) -> list[list[int]]:
         """ Apply block_id mapping for all values in list"""
+        if not self.enabled or not self.fwd_mapping_table:
+            return block_table_list
         return [[self.resolve(b) for b in bl] for bl in block_table_list]
 
     def unresolve(self, block_id: int) -> int:
@@ -207,7 +211,7 @@ class OnlineDefragmenter:
         key_caches = [cache[0] for cache in self.kv_caches]
         self.cache_utils(srcs, dsts, key_caches, self.block_size)
         if not self.is_mla:
-            value_caches = [cache[1] for cache in self.kv_caches]
+            value_caches = [cache[1] for cache in self.kv_caches if len(cache) > 1 and cache[1] is not None]
             self.cache_utils(srcs, dsts, value_caches, self.block_size)
 
     def warmup(self):

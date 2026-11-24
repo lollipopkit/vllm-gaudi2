@@ -73,8 +73,11 @@ def set_vllm_config(cfg):
 
     if hasattr(cfg.model_config, 'hf_config'):
         _VLLM_VALUES['model_type'] = cfg.model_config.hf_config.model_type
+        # the language model's type, also for multimodal wrappers (lfm3_vl / lfm3_omni -> lfm3)
+        _VLLM_VALUES['text_model_type'] = getattr(cfg.model_config.hf_text_config, 'model_type', None)
     else:
         _VLLM_VALUES['model_type'] = cfg.model_config.model_type
+        _VLLM_VALUES['text_model_type'] = cfg.model_config.model_type
     _VLLM_VALUES['prefix_caching'] = cfg.cache_config.enable_prefix_caching
 
 
@@ -109,6 +112,7 @@ def get_environment():
         Value('engine_version', _get_vllm_engine_version, env_var_type=str),
         Value('bridge_mode', _get_pt_bridge_mode, env_var_type=str, check=choice('eager', 'lazy')),
         VllmValue('model_type', str),
+        VllmValue('text_model_type', str),
         VllmValue('prefix_caching', boolean, depend=_get_prefix),
         Value('vllm_gaudi_commit', _get_vllm_hash, env_var_type=str)
     ]

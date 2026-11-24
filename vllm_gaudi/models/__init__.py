@@ -48,6 +48,29 @@ def register_model():
     ModelRegistry.register_model("PixtralForConditionalGeneration",
                                  "vllm_gaudi.models.pixtral:HPUPixtralForConditionalGeneration")
 
+    # Decode layer groups (VLLM_HPU_LFM3_COMPILE_LAYER_GROUP_SIZE); the VL / Omni language models resolve here too.
+    ModelRegistry.register_model("Lfm3ForCausalLM", "vllm_gaudi.models.lfm3:HpuLfm3ForCausalLM")
+
+    # Packed vision tower (fixed bucket shapes) for LFM3-VL and LFM3-Omni.
+    # TODO: remove the VLLM_HPU_LFM3_PACKED_TOWER fallback to the unpacked tower once the packed one has served
+    # for a while (docs/lfm3.md 2026-10-30 11:04).
+    from vllm_gaudi import envs
+    if envs.VLLM_HPU_LFM3_PACKED_TOWER:
+        ModelRegistry.register_model("Lfm3VlForConditionalGeneration",
+                                     "vllm_gaudi.models.lfm3_vl:HpuLfm3VlForConditionalGeneration")
+        ModelRegistry.register_model("Lfm3OmniForConditionalGeneration",
+                                     "vllm_gaudi.models.lfm3_vl:HpuLfm3OmniForConditionalGeneration")
+    else:
+        ModelRegistry.register_model("Lfm3VlForConditionalGeneration",
+                                     "vllm_gaudi.models.lfm3_vl_base:Lfm3VlForConditionalGeneration")
+        ModelRegistry.register_model("Lfm3OmniForConditionalGeneration",
+                                     "vllm_gaudi.models.lfm3_omni_base:Lfm3OmniForConditionalGeneration")
+
+    ModelRegistry.register_model("Inkling2ForConditionalGeneration",
+                                 "vllm_gaudi.models.inkling2:Inkling2ForConditionalGeneration")
+    ModelRegistry.register_model("Inkling2LoopForConditionalGeneration",
+                                 "vllm_gaudi.models.inkling2:Inkling2LoopForConditionalGeneration")
+
     from vllm_gaudi.models.dots_ocr import HpuDotsOCRForCausalLM  # noqa: F401
     ModelRegistry.register_model("DotsOCRForCausalLM", "vllm_gaudi.models.dots_ocr:HpuDotsOCRForCausalLM")
 
@@ -77,6 +100,8 @@ def register_model():
     # Gaudi (e.g. StarCoder, granite-*-code).
     ModelRegistry.register_model("GPTBigCodeForCausalLM", "vllm_gaudi.models.gpt_bigcode:GPTBigCodeForCausalLM")
     ModelRegistry.register_model("Starcoder2ForCausalLM", "vllm_gaudi.models.starcoder2:Starcoder2ForCausalLM")
+    # Torch context K/V precompute and HPU cache writes instead of the CUDA ops.
+    ModelRegistry.register_model("DFlash2DraftModel", "vllm_gaudi.models.qwen3_dflash2:HpuDFlash2Qwen3ForCausalLM")
 
     import vllm_gaudi.models.gptoss_mxfp4  # noqa: F401
     import vllm_gaudi.models.qwen3_next  # noqa: F401

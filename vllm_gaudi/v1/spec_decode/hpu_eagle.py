@@ -2,11 +2,21 @@
 import itertools
 
 import torch
-from vllm_gaudi.utils import async_h2d_copy
+from vllm_gaudi.utils import async_h2d_copy, slot_mapping_dtype
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+
+
+def _model_positions(positions: torch.Tensor, num_tokens: int, model_runner) -> torch.Tensor:
+    """mrope models (e.g. Qwen3.5) take [3, num_tokens] positions. Prefill already passes them in that
+    form; flat positions of text-only requests share the position across the three sections."""
+    if not getattr(model_runner, "uses_mrope", False):
+        return positions
+    if positions.numel() == 3 * num_tokens:
+        return positions.reshape(3, num_tokens)
+    return positions.reshape(1, -1).expand(3, -1)
 
 
 class HpuEagleProposer(EagleProposer):
@@ -39,7 +49,7 @@ class HpuEagleProposer(EagleProposer):
 
         ret_hidden_states = self.model(
             input_ids=target_token_ids,
-            positions=target_positions,
+            positions=_model_positions(target_positions, target_token_ids.numel(), model_runner),
             hidden_states=target_hidden_states,
             inputs_embeds=None,
             attn_metadata=common_attn_metadata,
@@ -52,6 +62,8 @@ class HpuEagleProposer(EagleProposer):
         else:
             last_hidden_states, hidden_states = ret_hidden_states
         last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
+        # prepare_inputs can return an empty (float) index tensor, e.g. for warmup batches without drafts.
+        last_token_indices = last_token_indices.long()
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
 
@@ -60,8 +72,11 @@ class HpuEagleProposer(EagleProposer):
             draft_token_ids = logits.argmax(dim=-1)
             return draft_token_ids.view(-1, 1)
 
-        # [num_tokens, 1]
-        target_positions = target_positions.view(-1)
+        # [num_tokens]; mrope positions [3, num_tokens] share the text position across sections.
+        if getattr(model_runner, "uses_mrope", False) and target_positions.numel() == 3 * target_token_ids.numel():
+            target_positions = target_positions.reshape(3, -1)[0]
+        else:
+            target_positions = target_positions.view(-1)
         # [batch_size]
         positions = target_positions[last_token_indices]
         if self.method == "mtp":
@@ -74,13 +89,17 @@ class HpuEagleProposer(EagleProposer):
 
         # The first draft tokens
         draft_token_ids = logits.argmax(dim=-1)
+        if draft_token_ids.numel() == 0:
+            # Nothing to extend (e.g. warmup batches without drafts); rotary prep cannot take 0 tokens.
+            return draft_token_ids.view(0, self.num_speculative_tokens)
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
         # Positions used by prepare_attn_metadata needs to be cpu because
         # compile only mode for warmup will not do any real computations
         target_positions_cpu = target_positions.cpu()
-        positions_cpu = target_positions_cpu[last_token_indices.cpu()]
+        # remainder: warmup runs in compile-only mode, where device index tensors hold garbage.
+        positions_cpu = target_positions_cpu[torch.remainder(last_token_indices.cpu(), target_positions_cpu.numel())]
 
         # Decode 1 token each time
         for token_index in range(self.num_speculative_tokens - 1):
@@ -108,7 +127,7 @@ class HpuEagleProposer(EagleProposer):
 
             ret_hidden_states = self.model(
                 input_ids=input_ids,
-                positions=input_positions,
+                positions=_model_positions(input_positions, input_ids.numel(), model_runner),
                 hidden_states=input_hidden_states,
                 inputs_embeds=inputs_embeds,
                 attn_metadata=attn_metadata,
@@ -174,9 +193,11 @@ class HpuEagleProposer(EagleProposer):
             positions,
             model_runner):
         # Prepare attn metadata on CPU. (Improve for pure HPU based attn metadata preparation)
-        block_size = model_runner.block_size
+        # Hybrid models align block_size to the mamba page; attention blocks use attn_block_size.
+        block_size = getattr(model_runner, "attn_block_size", model_runner.block_size)
         batch_size = positions.shape[0]
-        exceeds_max_model_len = positions >= self.max_model_len
+        # Warmup runs in compile-only mode: positions can be garbage, keep them in range.
+        exceeds_max_model_len = (positions >= self.max_model_len) | (positions < 0)
         clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
 
         # Note: block_table_cpu_tensor doesn't include the padding
@@ -187,11 +208,12 @@ class HpuEagleProposer(EagleProposer):
         # block_tables_list is a nested list of shape [num_seq, num_blocks]
         # num_blocks should include the slots needed for the current token
         # positions are the context lengths, and we need +1 for num_blocks
-        num_blocks = torch.ceil((positions + 1) / block_size).int()
-        num_blocks = num_blocks[:num_seq].tolist()
+        num_blocks = torch.ceil((clamped_positions + 1) / block_size).int()
+        num_blocks = num_blocks[:num_seq].clamp(max=block_table_cpu_tensor.shape[1]).tolist()
         block_tables_list = []
+        block_table_np = block_table_cpu_tensor.numpy()  # numpy rows: a torch getitem per request is slow
         for i, n in enumerate(num_blocks):
-            seq_block_table = block_table_cpu_tensor[i, :n].tolist()
+            seq_block_table = block_table_np[i, :n].tolist()
             assert len(seq_block_table) == n
             block_tables_list.append(seq_block_table)
         # Needs to be resolved by defragmenter
@@ -212,8 +234,7 @@ class HpuEagleProposer(EagleProposer):
         slot_mapping = block_ids * block_size + clamped_positions % block_size
         dummy_slots = itertools.cycle(range(model_runner._PAD_SLOT_ID, model_runner._PAD_SLOT_ID + block_size))
         slot_mapping[num_seq:].apply_(lambda _, ds=dummy_slots: next(ds))
-        # Slot mapping needs to be int64 (long) type
-        slot_mapping = slot_mapping.to(torch.int64)
+        slot_mapping = slot_mapping.to(slot_mapping_dtype())
 
         block_list, block_groups, block_usage = \
             model_runner.get_habana_paged_attn_buffers(

@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 ###############################################################################
 
-from vllm_gaudi.extension.config import Not, Hardware, VersionRange, ModelType, Kernel, Any, All, Value, ValueFromList, Env, Eq, Disabled, Enabled, MinPackageVersion, boolean, to_dict, split_values_and_flags, list_of
+from vllm_gaudi.extension.config import (Not, Hardware, VersionRange, ModelType, Kernel, Any, All, Value, ValueFromList,
+                                         Env, Eq, Disabled, Enabled, MinPackageVersion, boolean, to_dict,
+                                         split_values_and_flags, list_of)
 from vllm_gaudi.extension.kernels import fsdpa, block_softmax_adjustment
 from vllm_gaudi.extension.validation import for_all, choice
 
@@ -77,6 +79,15 @@ def get_experimental_flags():
         Env('VLLM_DEFRAG_THRESHOLD', int),
         Env('VLLM_DEFRAG_WITH_GRAPHS', boolean),
         Env('VLLM_DEBUG', list_of(str), check=for_all(choice('steps', 'defrag', 'fwd'))),
+        Env('VLLM_HPU_FLASHINFER_GDN', boolean),
+        Env('VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE', int),
+        Env('VLLM_HPU_LFM3_COMPILE_LAYER_GROUP_SIZE', int),
+        Env('VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE', boolean),
+        Env('VLLM_HPU_FLASHINFER_GDN_PREFILL', boolean),
+        Env('VLLM_HPU_GDN_DIRECT_STATE', boolean),
+        Env('VLLM_HPU_CGUID_DYNAMIC_QUANT', boolean),
+        Env('VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS', int),
+        Env('FLASHINFER_GAUDI_BACKEND', str),
     ]
     return to_dict(flags)
 
@@ -85,7 +96,8 @@ def get_features():
     supported_attn_impls = ['flex_impl', 'fsdpa_impl', 'naive_impl']
     features = [
         Value('fp32_alibi_biases', True, env_var='VLLM_ALIBI_USE_FLOAT32_BIASES'),
-        Value('fp32_softmax', Any(ModelType('qwen2'), ModelType('qwen2_5_vl'))),
+        # LFM3: the fast softmax doubles the per-token logprob deviation from the reference (docs/lfm3.md).
+        Value('fp32_softmax', Any(ModelType('qwen2'), ModelType('qwen2_5_vl'), Eq('text_model_type', 'lfm3'))),
         Value(
             'fused_block_softmax_adjustment',
             All(VersionRange(">=1.22.0.494"), Hardware('gaudi3'), Kernel(block_softmax_adjustment),

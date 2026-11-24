@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization import get_quantization_config as vllm_get_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+import vllm_gaudi.envs as gaudi_envs
 
 is_hpu_gaudi2 = htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi2
 is_hpu_gaudi3 = htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi3
@@ -947,7 +948,8 @@ def apply_block_fp8_linear_hpu(
             input_2d,
             layer.weight,
             layer.weight_scale_inv,
-            bias,
+            bias=bias,
+            use_cguid=not getattr(layer, "_hpu_avoid_cguid_dynamic_quant", False),
         )
         return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
     return apply_block_fp8_linear_hpu_dequant(
@@ -993,18 +995,23 @@ def apply_fp8_linear_hpu(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     trans_B: bool = True,
+    use_cguid: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
 ):
     if input_scale is None:
-        x_fp8, x_scale = dynamic_quant(input)
+        x_fp8, x_scale = dynamic_quant(input, use_cguid=use_cguid)
     else:
         x_fp8 = torch.ops.hpu.cast_to_fp8_v2(input, 1.0 / input_scale, False, False, torch.float8_e4m3fn)[0]
         x_scale = input_scale
+    resolved_dtype = out_dtype or input.dtype
+    if bias is not None and bias.dtype != resolved_dtype:
+        bias = bias.to(resolved_dtype)
     output = torch.ops.hpu.fp8_gemm_v2(A=x_fp8,
                                        trans_A=False,
                                        B=weight,
                                        trans_B=trans_B,
                                        D=None,
-                                       out_dtype=input.dtype,
+                                       out_dtype=resolved_dtype,
                                        A_scale_inv=x_scale,
                                        B_scale_inv=weight_scale,
                                        bias=bias,
@@ -1012,13 +1019,42 @@ def apply_fp8_linear_hpu(
     return output
 
 
-def dynamic_quant(data, single_scale=False):
+# Derived from 1CatAI/1Cat-vLLM-Gaudi (Apache-2.0) at e2266e0. Resolved at import
+# so compiled graphs never read the environment.
+_CGUID_DYNAMIC_QUANT = gaudi_envs.VLLM_HPU_CGUID_DYNAMIC_QUANT
+_CGUID_DYNAMIC_QUANT_MAX_ROWS = gaudi_envs.VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS
+
+
+def _use_cguid_dynamic_quant(data, use_cguid=True):
+    """Select the fused scale CGUID for decode-sized per-token activations only."""
+    return (use_cguid and _CGUID_DYNAMIC_QUANT and data.ndim == 2 and data.shape[0] <= _CGUID_DYNAMIC_QUANT_MAX_ROWS)
+
+
+def dynamic_quant(data, single_scale=False, use_cguid=True):
     if single_scale:
         scale = ((torch.abs(data)).max() + 1e-8) / FP8_MAX
+    elif _use_cguid_dynamic_quant(data, use_cguid=use_cguid):
+        # One CGUID replaces the abs + reduce_max + scale chain.
+        scale = torch.ops.hpu.calculate_scale_for_cast(
+            data,
+            2,  # MAX_ABS_PCS_CALCULATION
+            0,  # NO_SCALE_ROUNDING
+            -1,
+            True,
+            float(FP8_MAX),
+            1.0,
+        )
+        # Preserve the ordinary path's nonzero scale for zero/tiny rows.
+        scale = scale + (1e-8 / FP8_MAX)
+        # Keep the reciprocal in FP32: on Gaudi2, a gated BF16 activation, the
+        # scale CGUID and a BF16 reciprocal in one compiled region can corrupt
+        # the subsequent FP8 cast.
+        scale = scale.float()
     else:
         scale = ((torch.abs(data)).max(dim=-1).values + 1e-8) / FP8_MAX
         scale = scale.unsqueeze(-1)
-    data_fp8 = torch.ops.hpu.cast_to_fp8_v2(data, 1.0 / scale, False, False, torch.float8_e4m3fn)[0]
+    # reciprocal() rather than 1.0 / scale: no 1.0 constant materialized per linear (constant_f32 + mul per step).
+    data_fp8 = torch.ops.hpu.cast_to_fp8_v2(data, torch.reciprocal(scale), False, False, torch.float8_e4m3fn)[0]
     return data_fp8, scale.float()
 
 
@@ -1029,6 +1065,33 @@ def get_dequant_weights_func(self, ) -> Optional[Callable[[torch.nn.Module], tor
         if hasattr(quant_method, "dequant_fp8_weight"):
             return quant_method.dequant_fp8_weight
     return None
+
+
+def _halve_fp8_bytes(weight: torch.Tensor, chunk: int = 1 << 26) -> torch.Tensor:
+    """(x.float() * 0.5).to(float8_e4m3fn) on the bit pattern, bit-exact for all 256 values (NaN kept).
+
+    Works on the byte value as float (exact for 0..255), so it runs as plain elementwise float ops on the device:
+    magnitudes >= 16 (exponent >= 2) lose one exponent step (-8); below that the magnitude is the significand of
+    a subnormal or the smallest binade, halved with round-half-to-even (torch.round). The sign bit is untouched.
+    Processed in chunks of `chunk` bytes to bound the f32 temporaries for large fused weights.
+    """
+    src = weight.reshape(-1).view(torch.uint8)
+    out = torch.empty_like(src)
+    for s, d in zip(src.split(chunk), out.split(chunk)):
+        v = s.float()
+        mag = torch.where(v >= 128, v - 128, v)
+        halved = torch.where(mag >= 16, v - 8, v - mag + torch.round(mag * 0.5))
+        d.copy_(torch.where(mag == 127, v, halved))  # NaN
+    return out.view(torch.float8_e4m3fn).view(weight.shape)
+
+
+def _halve_fp8(weight: torch.Tensor, device: torch.device) -> torch.Tensor:
+    # fp8 <-> fp32 casts on the CPU ran at ~0.45 GB/s (~60 s for a 27 GB checkpoint), and Gaudi2's fp8 casts
+    # decode bytes >= 0x78 in its 240-max format. Copy the raw bytes to the device and halve the byte values
+    # there: bit-exact with the CPU cast, ~16 GB/s (a byte-table gather ran at ~1.2 GB/s, ~25 s of the load).
+    if device.type == "cpu":
+        return (weight.float() * 0.5).to(torch.float8_e4m3fn)
+    return _halve_fp8_bytes(weight.to(device))
 
 
 def gaudi_weight_wrapper(weight_loader):
@@ -1048,7 +1111,8 @@ def gaudi_weight_wrapper(weight_loader):
             else:
                 loaded_weight = args[1]
             if loaded_weight.dtype == torch.float8_e4m3fn:
-                loaded_weight = (loaded_weight.float() * 0.5).to(torch.float8_e4m3fn)
+                param = kwargs["param"] if "param" in kwargs else args[0]
+                loaded_weight = _halve_fp8(loaded_weight, param.device)
             else:
                 loaded_weight = (loaded_weight.data * 2.0)
             if in_kwargs:
@@ -1084,13 +1148,13 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
                                                         layer.quant_config.weight_block_size)
     if force_channel_fp8:
         # convert to channel-wise fp8
-        weight, weight_scale_inv = dynamic_quant(
-            dequant_block_fp8_weight_naive(weight,
-                                           layer.weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size,
-                                           original_M=orig_M,
-                                           original_N=orig_N,
-                                           do_unpad=True))
+        weight, weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(weight,
+                                                                                layer.weight_scale_inv.data,
+                                                                                layer.quant_config.weight_block_size,
+                                                                                original_M=orig_M,
+                                                                                original_N=orig_N,
+                                                                                do_unpad=True),
+                                                 use_cguid=False)
         weight_scale_inv = weight_scale_inv.squeeze(-1)
         layer.weight.data.copy_(weight)
         layer.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
@@ -1116,12 +1180,12 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
 def fp8_block_moe_prepare_weights(layer, force_channel_fp8=False):
     if force_channel_fp8:
         # convert to channel-wise fp8
-        w13_weight, w13_weight_scale_inv = dynamic_quant(
-            dequant_block_fp8_weight_naive(layer.w13_weight.data, layer.w13_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size))
-        w2_weight, w2_weight_scale_inv = dynamic_quant(
-            dequant_block_fp8_weight_naive(layer.w2_weight.data, layer.w2_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size))
+        w13_weight, w13_weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(
+            layer.w13_weight.data, layer.w13_weight_scale_inv.data, layer.quant_config.weight_block_size),
+                                                         use_cguid=False)
+        w2_weight, w2_weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(
+            layer.w2_weight.data, layer.w2_weight_scale_inv.data, layer.quant_config.weight_block_size),
+                                                       use_cguid=False)
         w13_weight_scale_inv, w2_weight_scale_inv \
             = w13_weight_scale_inv.squeeze(-1), w2_weight_scale_inv.squeeze(-1)
         layer.w13_weight.data.copy_(w13_weight)

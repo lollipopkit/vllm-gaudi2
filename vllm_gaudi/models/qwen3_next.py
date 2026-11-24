@@ -1,3 +1,4 @@
+import os
 from itertools import islice
 
 import torch
@@ -8,17 +9,57 @@ from vllm.model_executor.models.qwen3_next import (
     Qwen3NextSparseMoeBlock,
 )
 from vllm.sequence import IntermediateTensors
+from vllm_gaudi.models.layer_groups import LayerGroupModel, use_layer_groups
 from vllm_gaudi.models.utils import sequence_parallel_chunk
 
+# Larger decode batches keep per-layer graphs by default; configurable via env for A/B testing.
+HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE = int(os.environ.get("VLLM_HPU_QWEN3_LAYER_GROUP_MAX_BS", "16"))
 
-class HpuQwen3NextModel(UpstreamQwen3NextModel):
-    """Qwen3NextModel with residual initialized as zeros instead of None.
 
-    The upstream Qwen3NextModel.forward() sets ``residual = None`` for the first
-    rank, which creates a torch._dynamo type guard (None vs Tensor) that
-    causes recompilation between layer 0 and layers 1+. Initializing
-    residual as ``torch.zeros_like(hidden_states)`` eliminates this guard.
+def configure_hpu_qwen3_gated_fp8(model) -> int:
+    """Keep Gaudi2 gated-attention output projections on the abs/amax FP8 scale.
+
+    Combining the gate producer, the scale CGUID and the FP8 GEMM in one
+    compiled graph can corrupt outputs on Gaudi2, so mark those projections
+    to opt out of VLLM_HPU_CGUID_DYNAMIC_QUANT. Derived from
+    1CatAI/1Cat-vLLM-Gaudi (Apache-2.0) at e2266e0.
     """
+    from vllm_gaudi.extension import ops
+    from vllm_gaudi.ops.hpu_compressed_tensors import HPUCompressedTensorsLinearMethod
+    from vllm_gaudi.ops.hpu_fp8 import Fp8LinearMethod
+
+    if not ops.is_hpu_gaudi2:
+        return 0
+    count = 0
+    for attention in model.modules():
+        if not isinstance(attention, Qwen3NextAttention) or not attention.attn_output_gate:
+            continue
+        projection = attention.o_proj
+        if isinstance(getattr(projection, "quant_method", None), (Fp8LinearMethod, HPUCompressedTensorsLinearMethod)):
+            projection._hpu_avoid_cguid_dynamic_quant = True
+            count += 1
+    return count
+
+
+class HpuQwen3NextModel(LayerGroupModel, UpstreamQwen3NextModel):
+    """Qwen3NextModel with decode layer groups and guard-free residual handling.
+
+    Decode layer groups pass ``residual = None`` into group 0 (which gets its own code object via
+    ``first_group_null_residual``), avoiding an eager ``torch.zeros_like`` launch per decode step;
+    the per-layer fallback initializes ``residual = torch.zeros_like(hidden_states)`` so all per-layer
+    regions see a Tensor without None-vs-Tensor recompiles.
+    """
+    layer_group_size_env = "VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE"
+
+    def hpu_layer_group_final_norm(self) -> torch.nn.Module | None:
+        return self.norm if get_pp_group().is_last_rank else None
+
+    def hpu_layer_kinds(self) -> tuple | None:
+        kinds = super().hpu_layer_kinds()
+        layers = tuple(islice(self.layers, self.start_layer, self.end_layer))
+        if kinds is None:
+            return tuple(type(layer.mlp) for layer in layers)
+        return tuple((k, type(layer.mlp)) for k, layer in zip(kinds, layers))
 
     def forward(
         self,
@@ -29,27 +70,39 @@ class HpuQwen3NextModel(UpstreamQwen3NextModel):
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
-            residual = torch.zeros_like(hidden_states)
+            residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for layer_idx, layer in enumerate(
-                islice(self.layers, self.start_layer, self.end_layer),
-                start=self.start_layer,
-        ):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
-            self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
+        grouped_final_norm = False
+        if use_layer_groups(self, hidden_states.shape[0], HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE):
+            for group in self._hpu_compiled_layer_groups:
+                hidden_states, residual, *captures = group(positions=positions,
+                                                           hidden_states=hidden_states,
+                                                           residual=residual)
+                aux_hidden_states.extend(captures)
+            grouped_final_norm = self._hpu_layer_groups_include_final_norm
+        else:
+            if residual is None:
+                residual = torch.zeros_like(hidden_states)
+            for layer_idx, layer in enumerate(
+                    islice(self.layers, self.start_layer, self.end_layer),
+                    start=self.start_layer,
+            ):
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+                self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not grouped_final_norm:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -183,6 +236,9 @@ def apply_hpu_qwen3_residual_fix(model) -> bool:
 
     if inner_model is None:
         return False
+
+    if isinstance(inner_model, (Qwen3_5Model, UpstreamQwen3NextModel)):
+        configure_hpu_qwen3_gated_fp8(inner_model)
 
     # Check if it's a Qwen3_5Model or Qwen3NextModel that needs the fix
     if isinstance(inner_model, Qwen3_5Model):

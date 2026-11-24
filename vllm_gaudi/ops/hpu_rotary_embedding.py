@@ -30,30 +30,72 @@ def _rotary_base_init_on_cpu(self, *args, **kwargs):
 RotaryEmbeddingBase.__init__ = _rotary_base_init_on_cpu
 
 
+def _cos_sin_from_cache(rope: torch.nn.Module,
+                        positions: torch.Tensor,
+                        offsets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos / sin rows of rope.cos_sin_cache for the flattened positions, expanded to the rotary dim."""
+    if offsets is not None:
+        offsets = offsets.view(positions.shape[0], -1)
+        positions = positions + offsets
+    positions = positions.flatten()
+    num_tokens = positions.shape[0]
+    cos_sin = rope.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    if rope.is_neox_style:
+        return torch.cat((cos, cos), dim=-1), torch.cat((sin, sin), dim=-1)
+    return (torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1]),
+            torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1]))
+
+
+def _prepare_cos_sin(rope: torch.nn.Module,
+                     positions: torch.Tensor,
+                     offsets: Optional[torch.Tensor] = None,
+                     recompute_cos_sin: bool = False) -> None:
+    """Called by the model adapter, outside the compiled regions, for the one rotary module it finds: cos / sin for
+    the step as buffers, which the adapter deletes after the step."""
+    rope.recompute_cos_sin = recompute_cos_sin
+    if offsets is None and getattr(rope._compute_cos_sin, "__func__", None) is _cos_sin_from_cache:
+        cos_exp = getattr(rope, "_cos_exp_cache", None)
+        if (cos_exp is None or cos_exp.device != rope.cos_sin_cache.device
+                or cos_exp.shape[0] != rope.cos_sin_cache.shape[0]):
+            c, s = rope.cos_sin_cache.chunk(2, dim=-1)
+            if rope.is_neox_style:
+                cos_exp = torch.cat((c, c), dim=-1).contiguous()
+                sin_exp = torch.cat((s, s), dim=-1).contiguous()
+            else:
+                cos_exp = torch.repeat_interleave(c, 2, dim=-1, output_size=rope.cos_sin_cache.shape[-1]).contiguous()
+                sin_exp = torch.repeat_interleave(s, 2, dim=-1, output_size=rope.cos_sin_cache.shape[-1]).contiguous()
+            object.__setattr__(rope, "_cos_exp_cache", cos_exp)
+            object.__setattr__(rope, "_sin_exp_cache", sin_exp)
+        else:
+            sin_exp = rope._sin_exp_cache
+        pos = positions.flatten()
+        n = pos.shape[0]
+        cos = cos_exp.index_select(0, pos).view(n, 1, -1)
+        sin = sin_exp.index_select(0, pos).view(n, 1, -1)
+    else:
+        cos, sin = rope._compute_cos_sin(positions, offsets)
+    rope.register_buffer("cos", cos, persistent=False)
+    rope.register_buffer("sin", sin, persistent=False)
+
+
+def _cos_sin_for_call(rope: torch.nn.Module, positions: torch.Tensor,
+                      offsets: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos / sin for one forward call. A module the adapter did not prepare this step (models with several rotary
+    modules, e.g. LFM3 and Gemma sliding / full layers) computes them as locals: module state with the step's shape
+    would enter the compiled regions' guards. Offsets (long-context LoRA) and scaled ropes are recomputed too."""
+    if (getattr(rope, "sin", None) is None or getattr(rope, "recompute_cos_sin", False)
+            or hasattr(rope, "scaling_factors") or hasattr(rope, "scaling_factor")):
+        return rope._compute_cos_sin(positions, offsets)
+    return rope.cos, rope.sin
+
+
 @RotaryEmbedding.register_oot
 class HPURotaryEmbedding(RotaryEmbedding):
     """Original rotary positional embedding."""
 
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
-        if offsets is not None:
-            offsets = offsets.view(positions.shape[0], -1)
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+    _compute_cos_sin = _cos_sin_from_cache
+    prepare_cos_sin = _prepare_cos_sin
 
     def forward_oot(
         self,
@@ -64,12 +106,7 @@ class HPURotaryEmbedding(RotaryEmbedding):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         from habana_frameworks.torch.hpex.kernels import (RotaryPosEmbeddingMode, apply_rotary_pos_emb)
 
-        # Prepare cos-sin caches for long-context + LoRA with offsets for every
-        # forward, since the offset information wasn't available previously
-        if not hasattr(self, "sin") or self.recompute_cos_sin:
-            self.prepare_cos_sin(positions, offsets, recompute_cos_sin=True)
-        if hasattr(self, "scaling_factors") or hasattr(self, "scaling_factor") or self.sin is None:
-            self.prepare_cos_sin(positions, offsets)
+        cos, sin = _cos_sin_for_call(self, positions, offsets)
         num_tokens = positions.numel()
         # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
         # to query hidden dimension, so the original tensors need to be
@@ -80,8 +117,6 @@ class HPURotaryEmbedding(RotaryEmbedding):
         # and expansion of cos/sin tensors via repeat_interleave
         rope_mode: RotaryPosEmbeddingMode
         rope_mode = RotaryPosEmbeddingMode.BLOCKWISE if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE
-        sin = self.sin
-        cos = self.cos
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         # key is None on KV-shared (YOCO) layers, which rotate Q only - Gemma4 /
@@ -116,26 +151,8 @@ class HPURotaryEmbedding(RotaryEmbedding):
 @LinearScalingRotaryEmbedding.register_oot
 class HPULinearScalingRotaryEmbedding(LinearScalingRotaryEmbedding):
 
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
-        if offsets is not None:
-            offsets = offsets.view(positions.shape[0], -1)
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+    _compute_cos_sin = _cos_sin_from_cache
+    prepare_cos_sin = _prepare_cos_sin
 
     def forward_oot(
         self,
@@ -146,12 +163,7 @@ class HPULinearScalingRotaryEmbedding(LinearScalingRotaryEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from habana_frameworks.torch.hpex.kernels import (RotaryPosEmbeddingMode, apply_rotary_pos_emb)
 
-        # Prepare cos-sin caches for long-context + LoRA with offsets for every
-        # forward, since the offset information wasn't available previously
-        if not hasattr(self, "sin") or self.recompute_cos_sin:
-            self.prepare_cos_sin(positions, offsets, recompute_cos_sin=True)
-        if hasattr(self, "scaling_factors") or hasattr(self, "scaling_factor") or self.sin is None:
-            self.prepare_cos_sin(positions, offsets)
+        cos, sin = _cos_sin_for_call(self, positions, offsets)
         num_tokens = positions.shape[0] * positions.shape[1]
         # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
         # to query hidden dimension, so the original tensors need to be
@@ -162,8 +174,6 @@ class HPULinearScalingRotaryEmbedding(LinearScalingRotaryEmbedding):
         # and expansion of cos/sin tensors via repeat_interleave
         rope_mode: RotaryPosEmbeddingMode
         rope_mode = RotaryPosEmbeddingMode.BLOCKWISE if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE
-        sin = self.sin
-        cos = self.cos
         query_shape = query.shape
         key_shape = key.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -190,26 +200,8 @@ class HPULinearScalingRotaryEmbedding(LinearScalingRotaryEmbedding):
 @DynamicNTKScalingRotaryEmbedding.register_oot
 class HPUDynamicNTKScalingRotaryEmbedding(DynamicNTKScalingRotaryEmbedding):
 
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
-        if offsets is not None:
-            offsets = offsets.view(positions.shape[0], -1)
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+    _compute_cos_sin = _cos_sin_from_cache
+    prepare_cos_sin = _prepare_cos_sin
 
     def forward_oot(
         self,
@@ -220,12 +212,7 @@ class HPUDynamicNTKScalingRotaryEmbedding(DynamicNTKScalingRotaryEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from habana_frameworks.torch.hpex.kernels import (RotaryPosEmbeddingMode, apply_rotary_pos_emb)
 
-        # Prepare cos-sin caches for long-context + LoRA with offsets for every
-        # forward, since the offset information wasn't available previously
-        if not hasattr(self, "sin") or self.recompute_cos_sin:
-            self.prepare_cos_sin(positions, offsets, recompute_cos_sin=True)
-        if hasattr(self, "scaling_factors") or hasattr(self, "scaling_factor") or self.sin is None:
-            self.prepare_cos_sin(positions, offsets)
+        cos, sin = _cos_sin_for_call(self, positions, offsets)
         num_tokens = positions.shape[0] * positions.shape[1]
         # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
         # to query hidden dimension, so the original tensors need to be
@@ -236,8 +223,6 @@ class HPUDynamicNTKScalingRotaryEmbedding(DynamicNTKScalingRotaryEmbedding):
         # and expansion of cos/sin tensors via repeat_interleave
         rope_mode: RotaryPosEmbeddingMode
         rope_mode = RotaryPosEmbeddingMode.BLOCKWISE if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE
-        sin = self.sin
-        cos = self.cos
         query_shape = query.shape
         key_shape = key.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -264,26 +249,8 @@ class HPUDynamicNTKScalingRotaryEmbedding(DynamicNTKScalingRotaryEmbedding):
 @YaRNScalingRotaryEmbedding.register_oot
 class HPUYaRNScalingRotaryEmbedding(YaRNScalingRotaryEmbedding):
 
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
-        if offsets is not None:
-            offsets = offsets.view(positions.shape[0], -1)
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+    _compute_cos_sin = _cos_sin_from_cache
+    prepare_cos_sin = _prepare_cos_sin
 
     def forward_oot(
         self,
@@ -294,12 +261,7 @@ class HPUYaRNScalingRotaryEmbedding(YaRNScalingRotaryEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from habana_frameworks.torch.hpex.kernels import (RotaryPosEmbeddingMode, apply_rotary_pos_emb)
 
-        # Prepare cos-sin caches for long-context + LoRA with offsets for every
-        # forward, since the offset information wasn't available previously
-        if not hasattr(self, "sin") or self.recompute_cos_sin:
-            self.prepare_cos_sin(positions, offsets, recompute_cos_sin=True)
-        if hasattr(self, "scaling_factors") or hasattr(self, "scaling_factor") or self.sin is None:
-            self.prepare_cos_sin(positions, offsets)
+        cos, sin = _cos_sin_for_call(self, positions, offsets)
         num_tokens = positions.shape[0] * positions.shape[1]
         # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
         # to query hidden dimension, so the original tensors need to be
@@ -310,8 +272,6 @@ class HPUYaRNScalingRotaryEmbedding(YaRNScalingRotaryEmbedding):
         # and expansion of cos/sin tensors via repeat_interleave
         rope_mode: RotaryPosEmbeddingMode
         rope_mode = RotaryPosEmbeddingMode.BLOCKWISE if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE
-        sin = self.sin
-        cos = self.cos
         query_shape = query.shape
         key_shape = key.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -338,26 +298,8 @@ class HPUYaRNScalingRotaryEmbedding(YaRNScalingRotaryEmbedding):
 @DeepseekScalingRotaryEmbedding.register_oot
 class HPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
 
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
-        if offsets is not None:
-            offsets = offsets.view(positions.shape[0], -1)
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+    _compute_cos_sin = _cos_sin_from_cache
+    prepare_cos_sin = _prepare_cos_sin
 
     def forward(
         self,
@@ -368,12 +310,7 @@ class HPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from habana_frameworks.torch.hpex.kernels import (RotaryPosEmbeddingMode, apply_rotary_pos_emb)
 
-        # Prepare cos-sin caches for long-context + LoRA with offsets for every
-        # forward, since the offset information wasn't available previously
-        if not hasattr(self, "sin") or self.recompute_cos_sin:
-            self.prepare_cos_sin(positions, offsets, recompute_cos_sin=True)
-        if hasattr(self, "scaling_factors") or hasattr(self, "scaling_factor") or self.sin is None:
-            self.prepare_cos_sin(positions, offsets)
+        cos, sin = _cos_sin_for_call(self, positions, offsets)
         num_tokens = positions.shape[0] * positions.shape[1]
 
         # deepseek_v2 MLA attention did an unsqueeze on key due to assumption on
@@ -389,8 +326,6 @@ class HPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         # and expansion of cos/sin tensors via repeat_interleave
         rope_mode: RotaryPosEmbeddingMode
         rope_mode = RotaryPosEmbeddingMode.BLOCKWISE if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE
-        sin = self.sin
-        cos = self.cos
         query_shape = query.shape
         key_shape = key.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -427,26 +362,8 @@ class HPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
 @Llama3RotaryEmbedding.register_oot
 class HPULlama3RotaryEmbedding(Llama3RotaryEmbedding):
 
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
-        if offsets is not None:
-            offsets = offsets.view(positions.shape[0], -1)
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+    _compute_cos_sin = _cos_sin_from_cache
+    prepare_cos_sin = _prepare_cos_sin
 
     def forward_oot(
         self,
@@ -457,12 +374,7 @@ class HPULlama3RotaryEmbedding(Llama3RotaryEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from habana_frameworks.torch.hpex.kernels import (RotaryPosEmbeddingMode, apply_rotary_pos_emb)
 
-        # Prepare cos-sin caches for long-context + LoRA with offsets for every
-        # forward, since the offset information wasn't available previously
-        if not hasattr(self, "sin") or self.recompute_cos_sin:
-            self.prepare_cos_sin(positions, offsets, recompute_cos_sin=True)
-        if hasattr(self, "scaling_factors") or hasattr(self, "scaling_factor") or self.sin is None:
-            self.prepare_cos_sin(positions, offsets)
+        cos, sin = _cos_sin_for_call(self, positions, offsets)
         num_tokens = positions.shape[0] * positions.shape[1]
         # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
         # to query hidden dimension, so the original tensors need to be
@@ -473,8 +385,6 @@ class HPULlama3RotaryEmbedding(Llama3RotaryEmbedding):
         # and expansion of cos/sin tensors via repeat_interleave
         rope_mode: RotaryPosEmbeddingMode
         rope_mode = RotaryPosEmbeddingMode.BLOCKWISE if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE
-        sin = self.sin
-        cos = self.cos
         query_shape = query.shape
         key_shape = key.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -520,11 +430,9 @@ class HPUPhi3LongRoPEScaledRotaryEmbedding(Phi3LongRoPEScaledRotaryEmbedding):
         logger.info_once("HPU LongRoPE: use_long_rope=%s (original_max_position_embeddings=%d)", self.use_long_rope,
                          self.original_max_position_embeddings)
 
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
+    def _compute_cos_sin(self,
+                         positions: torch.Tensor,
+                         offsets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
         if offsets is not None:
             offsets = offsets.view(positions.shape[0], -1)
             positions = positions + offsets
@@ -535,10 +443,9 @@ class HPUPhi3LongRoPEScaledRotaryEmbedding(Phi3LongRoPEScaledRotaryEmbedding):
         num_tokens = positions.shape[0]
         cos_sin = self.long_short_cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
         cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = torch.cat((cos, cos), dim=-1)
-        sin = torch.cat((sin, sin), dim=-1)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        return torch.cat((cos, cos), dim=-1), torch.cat((sin, sin), dim=-1)
+
+    prepare_cos_sin = _prepare_cos_sin
 
     # The shared HPU forward does the rotary/pass split; bind forward too, as upstream is no CustomOp.
     forward_oot = forward = HPURotaryEmbedding.forward_oot
@@ -637,26 +544,23 @@ class HPULlama4VisionRotaryEmbedding(Llama4VisionRotaryEmbedding):
 @MRotaryEmbedding.register_oot
 class HPUMRotaryEmbedding(MRotaryEmbedding):
 
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
-        if offsets is not None:
-            offsets = offsets.view(positions.shape[0], -1)
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.mrope_section and self.mrope_interleaved:
+            # apply_interleaved_rope's channel masks, built once: in the graph they are an arange / mod / compare
+            # chain of ~12 dependent integer nodes in every attention layer of every step.
+            channels = torch.arange(self.rotary_dim // 2)
+            self.register_buffer("mrope_is_height", (channels % 3 == 1) & (channels < self.mrope_section[1] * 3),
+                                 persistent=False)
+            self.register_buffer("mrope_is_width", (channels % 3 == 2) & (channels < self.mrope_section[2] * 3),
+                                 persistent=False)
+
+    def _interleave(self, x: torch.Tensor) -> torch.Tensor:
+        """apply_interleaved_rope with the precomputed masks (same selection, bit-identical)."""
+        return torch.where(self.mrope_is_width, x[2], torch.where(self.mrope_is_height, x[1], x[0]))
+
+    _compute_cos_sin = _cos_sin_from_cache
+    prepare_cos_sin = _prepare_cos_sin
 
     def forward_oot(
         self,
@@ -678,11 +582,9 @@ class HPUMRotaryEmbedding(MRotaryEmbedding):
         cos, sin = cos_sin.chunk(2, dim=-1)
         if positions.ndim == 2:
             assert self.mrope_section
-            if getattr(self, "mrope_interleaved", False):
-                from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
-
-                cos = apply_interleaved_rope(cos, self.mrope_section)
-                sin = apply_interleaved_rope(sin, self.mrope_section)
+            if self.mrope_interleaved:
+                cos = self._interleave(cos)
+                sin = self._interleave(sin)
             else:
                 cos = torch.cat([m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))], dim=-1)
                 sin = torch.cat([m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))], dim=-1)

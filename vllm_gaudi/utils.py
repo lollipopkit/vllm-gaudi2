@@ -37,6 +37,12 @@ def has_quant_config(model_config: ModelConfig) -> bool:
     return model_config.quantization == "inc" or os.getenv("QUANT_CONFIG", None) is not None
 
 
+def slot_mapping_dtype() -> torch.dtype:
+    """KV-cache slot indices: int32 on the HPU (TPC index kernels take int32; int64 costs a cast node per KV write),
+    int64 under fake HPU, where CPU index_copy_ requires it."""
+    return torch.int64 if is_fake_hpu() else torch.int32
+
+
 def async_h2d_copy(source, dest_tensor=None, dtype=None, device="hpu"):
     """
     Asynchronously transfer data from host to device.

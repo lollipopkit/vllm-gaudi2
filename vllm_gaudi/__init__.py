@@ -94,6 +94,7 @@ def register_utils():
     from vllm_gaudi import patches as _hpu_patches
 
     _hpu_patches.patch_hf3fs_mock_client()
+    _hpu_patches.apply_plugin_registrations()
 
 
 def register_ops():
@@ -112,6 +113,7 @@ def register_ops():
     import vllm_gaudi.ops.hpu_layernorm  # noqa: F401
     import vllm_gaudi.ops.hpu_lora  # noqa: F401
     import vllm_gaudi.ops.hpu_mamba_mixer2  # noqa: F401
+    import vllm_gaudi.ops.hpu_short_conv  # noqa: F401
     import vllm_gaudi.ops.hpu_rotary_embedding  # noqa: F401
     import vllm_gaudi.ops.hpu_modelopt  # noqa: F401
     import vllm_gaudi.ops.hpu_compressed_tensors  # noqa: F401

@@ -67,6 +67,17 @@ MULTIMODAL_CONFIG = {
         'is_batch_based': False,
         'buckets': []
     },
+    # LFM3-VL: native-resolution tower, patches kept in merge-block order; padding to a
+    # bucket would change the block layout, so no padding and no guessed buckets.
+    'lfm3_vl': {
+        'is_batch_based': False,
+        'buckets': []
+    },
+    # LFM3-Omni: the same vision tower as LFM3-VL.
+    'lfm3_omni': {
+        'is_batch_based': False,
+        'buckets': []
+    },
 }
 
 

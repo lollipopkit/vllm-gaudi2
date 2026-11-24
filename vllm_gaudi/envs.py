@@ -21,6 +21,22 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER_RATIO: float = 0.4
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
     VLLM_COMPACT_GDN: bool = False
+    VLLM_HPU_FLASHINFER_GDN: bool = False
+    VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE: bool = False
+    VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
+    VLLM_HPU_GDN_DIRECT_STATE: bool = True
+    VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
+    VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
+    VLLM_HPU_FP8_LM_HEAD: bool = False
+    VLLM_HPU_SAMPLER_TOPK_CAP: int = 64
+    VLLM_HPU_GDN_PREFILL_TUNING: str = ""
+    VLLM_HPU_GDN_TPC_DECODE: bool = False
+    VLLM_HPU_LFM3_PACKED_TOWER: bool = True
+
+
+def _bool_env(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true")
+
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -115,6 +131,54 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it lazily rather than caching it at import time.
     "VLLM_COMPACT_GDN":
     lambda: os.environ.get("VLLM_COMPACT_GDN", "0").strip().lower() in ("1", "true"),
+
+    # Qwen3.5/3.8 GDN tactics derived from 1CatAI/1Cat-vLLM-Gaudi.
+    # Parent switch for the FlashInfer-Gaudi GDN decode adapter: packed
+    # single-token recurrence on the contiguous group-major compact state.
+    "VLLM_HPU_FLASHINFER_GDN":
+    lambda: _bool_env("VLLM_HPU_FLASHINFER_GDN", "false"),
+    # Fused gating + width-4 conv + recurrence recipe for Qwen3.8 TP1 decode
+    # batches 1/2/4/8/16/32. Follows the parent switch unless set.
+    "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE":
+    lambda: _bool_env("VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE", os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false")),
+    # Shape-gated FlashQLA graph tactic for single-sequence Qwen3.8 TP1 GDN
+    # prefill. Independent of the parent switch.
+    "VLLM_HPU_FLASHINFER_GDN_PREFILL":
+    lambda: _bool_env("VLLM_HPU_FLASHINFER_GDN_PREFILL", "false"),
+    # Mark full decode batches whose requests own compact base slots
+    # 0..B-1 as direct-state so GDN layers can use contiguous views instead of
+    # index_select/index_copy. Requires VLLM_HPU_FLASHINFER_GDN, compact GDN
+    # and prefix caching off.
+    "VLLM_HPU_GDN_DIRECT_STATE":
+    lambda: _bool_env("VLLM_HPU_GDN_DIRECT_STATE", "true"),
+    # Use the calculate_scale_for_cast CGUID for decode-sized per-token dynamic
+    # FP8 activation scales. Follows VLLM_HPU_FLASHINFER_GDN unless set.
+    "VLLM_HPU_CGUID_DYNAMIC_QUANT":
+    lambda: _bool_env("VLLM_HPU_CGUID_DYNAMIC_QUANT", os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false")),
+    # Largest flattened row count that uses the CGUID; prefill keeps the
+    # abs/amax path.
+    "VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS", "32")),
+    # Quantize an unquantized bf16 lm_head to per-channel FP8 after loading.
+    "VLLM_HPU_FP8_LM_HEAD":
+    lambda: _bool_env("VLLM_HPU_FP8_LM_HEAD", "false"),
+    # Top-k/top-p sampling over the top-N logits instead of sorting the vocabulary, used when every
+    # request's top_k <= N; 0 disables (native full sort).
+    "VLLM_HPU_SAMPLER_TOPK_CAP":
+    lambda: int(os.getenv("VLLM_HPU_SAMPLER_TOPK_CAP", "64")),
+    # JSON object merged into the promoted GDN prefill tactic's tuning, e.g. '{"compute_dtype": "bfloat16"}'
+    # (A/B of tactic knobs without editing the manifest).
+    "VLLM_HPU_GDN_PREFILL_TUNING":
+    lambda: os.getenv("VLLM_HPU_GDN_PREFILL_TUNING", ""),
+    # GDN decode recurrence on the custom single-pass TPC kernel (tpc/); the SSM state pool becomes KV-major.
+    # Needs the fused direct-state decode and the kernel library on GC_KERNEL_PATH.
+    "VLLM_HPU_GDN_TPC_DECODE":
+    lambda: _bool_env("VLLM_HPU_GDN_TPC_DECODE", "false"),
+    # LFM3-VL / LFM3-Omni vision tower on packed bucket shapes (vllm_gaudi/models/lfm3_vl.py); false keeps the
+    # upstream tower (one graph per combination of frame sizes). TODO: remove with the fallback in models/__init__.py.
+    "VLLM_HPU_LFM3_PACKED_TOWER":
+    lambda: _bool_env("VLLM_HPU_LFM3_PACKED_TOWER", "true"),
+
 }
 
 # end-env-vars-definition

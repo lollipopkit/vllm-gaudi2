@@ -90,6 +90,25 @@ Currently:
   version that uses FusedSDPA when the ``fsdpa_impl`` attention implementation
   is configured, providing 1.4-2x performance improvement for models that use
   transformers SDPA attention (e.g., vision encoders in Gemma4 models).
+
+* ``torch.ops.hpu.fp8_gemm_v2`` meta (fake-tensor shape) — habana_frameworks
+  computes the output shape in C++ on concrete ints, which specializes every
+  symbolic input dim: with the FP8 KV cache the paged-attention matmuls pin the
+  decode graph to one batch size and block count, so warmup re-traces each decode
+  layer group per batch size. The replacement computes the matmul shape
+  symbolically (concrete shapes still go through the original).
+
+* Inkling2 config and ``inkling2_fp8`` quantization registration — registers
+  ``Inkling2*Config`` in ``vllm.transformers_utils.config`` and ``inkling2_fp8``
+  via ``register_quantization_config`` so upstream ``vllm`` stays unmodified.
+
+* ``LogitsProcessor._apply_head`` — forwards ``out_dtype=self.head_dtype`` when
+  ``lm_head.quant_method.supports_out_dtype`` is true (e.g. ``HPUFp8LMHeadMethod``
+  producing ``fp32`` logits directly from ``fp8_gemm_v2``).
+
+* ``VllmConfig._get_v1_model_runner_unsupported_features`` — allows DFlash
+  candidate-head drafts on V1 when the active platform advertises
+  ``supports_v1_dflash_candidate_heads()``.
 """
 
 import functools
@@ -272,7 +291,8 @@ def _hpu_gather_logprobs(
 
     assert token_ids.dtype == torch.int64
     topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
-    token_ids = token_ids.unsqueeze(-1)
+    # The rejection sampler can hand over CPU token ids (spec decode with logprobs).
+    token_ids = token_ids.to(logprobs.device).unsqueeze(-1)
     token_logprobs = logprobs.gather(-1, token_ids)
     # mark_unbacked calls intentionally omitted — forbidden on HPU dynamo.
     token_ranks = _sampler_mod.batched_count_greater_than(logprobs, token_logprobs)
@@ -845,6 +865,51 @@ def _patch_sdpa_attention_forward() -> None:
     _ensure_fsdpa_cached()
 
 
+def _fp8_gemm_v2_out_shape(A, trans_A, B, trans_B) -> list:
+    """Output shape of fp8_gemm_v2: matmul broadcasting over the batch dims of op(A) @ op(B)."""
+    m = A.shape[-1] if trans_A else A.shape[-2]
+    n = B.shape[-2] if trans_B else B.shape[-1]
+    batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+    return [*batch, m, n]
+
+
+def _patch_fp8_gemm_v2_meta() -> None:
+    # TODO: remove once habana_frameworks' fp8_gemm_v2 meta handles symbolic shapes.
+    try:
+        from habana_frameworks.torch.dynamo import _custom_op_meta_registrations as _hpu_meta
+        hpu_meta_lib = _hpu_meta._meta_lib_dont_use_me_use_register_meta_for_hpu
+        packet = torch.ops.hpu.fp8_gemm_v2
+    except (ImportError, AttributeError):
+        return
+    from torch._decomp import global_decomposition_table
+
+    meta_table = global_decomposition_table["meta"]
+    for name in ("default", "scalar", "scalar_list"):
+        overload = getattr(packet, name, None)
+        original = meta_table.get(overload) if overload is not None else None
+        if original is None or getattr(original, "_vllm_gaudi_symbolic", False):
+            continue
+
+        def meta(A, trans_A, B, trans_B, D, out_dtype, *args, _original=original, **kwargs):
+            # Only plain outputs of symbolic matmuls; D / a default dtype keep the original semantics.
+            if (D is not None or out_dtype is None or A.dim() < 2 or B.dim() < 2
+                    or not any(isinstance(d, torch.SymInt) for d in (*A.shape, *B.shape))):
+                return _original(A, trans_A, B, trans_B, D, out_dtype, *args, **kwargs)
+            return A.new_empty(_fp8_gemm_v2_out_shape(A, trans_A, B, trans_B), dtype=out_dtype)
+
+        meta._vllm_gaudi_symbolic = True  # type: ignore[attr-defined]
+        try:
+            # Same registrations as habana's activate_hpu_custom_op_meta: C++ Meta kernel, then Python dispatcher.
+            hpu_meta_lib.impl(overload, meta)
+        except RuntimeError as e:
+            from vllm.logger import init_logger
+            init_logger(__name__).warning("fp8_gemm_v2.%s: symbolic meta not registered (%s)", name, e)
+            continue
+        meta_table[overload] = meta
+        overload.py_kernels[torch._C.DispatchKey.Meta] = meta
+        overload._dispatch_cache.clear()
+
+
 def _patch_inc_quantization_config() -> None:
     """Register the HPU ``_FakeINCConfig`` as the resolver for ``inc``.
 
@@ -865,6 +930,129 @@ def _patch_inc_quantization_config() -> None:
     from vllm_gaudi.extension.quant import _FakeINCConfig
 
     register_quantization_config("inc")(_FakeINCConfig)
+
+
+def _patch_inkling2_registrations() -> None:
+    """Register Inkling2 HF config classes and the ``inkling2_fp8`` quantization method.
+
+    Keeping these registrations in the HPU plugin avoids patching upstream
+    ``vllm/transformers_utils/config.py``, ``vllm/transformers_utils/configs/__init__.py``,
+    ``vllm/config/model.py``, and ``vllm/model_executor/layers/quantization/__init__.py``.
+    Because ``inkling2_fp8`` is registered via ``register_quantization_config``,
+    ``ModelConfig._verify_quantization`` treats it as a custom override and probes it
+    ahead of built-in quantization overrides (e.g. ``modelopt`` / ``mxfp8``).
+    """
+    from vllm.model_executor.layers.quantization import (
+        QUANTIZATION_METHODS,
+        _CUSTOMIZED_METHOD_TO_QUANT_CONFIG,
+        register_quantization_config,
+    )
+    from vllm.transformers_utils import config as _hf_config_mod
+    from vllm.transformers_utils import configs as _hf_configs_mod
+
+    from vllm_gaudi.models.inkling2.quant_config import Inkling2FP8QuantConfig
+    from vllm_gaudi.platform import HpuPlatform
+
+    _hf_configs_mod._CLASS_TO_MODULE.update({
+        "Inkling2ModelConfig": "vllm_gaudi.models.inkling2.configs",
+        "Inkling2MMConfig": "vllm_gaudi.models.inkling2.configs",
+        "Inkling2LoopMMConfig": "vllm_gaudi.models.inkling2.configs",
+    })
+    _hf_config_mod._CONFIG_REGISTRY.update({
+        "inkling2": "Inkling2MMConfig",
+        "inkling2_loop": "Inkling2LoopMMConfig",
+        "inkling2_model": "Inkling2ModelConfig",
+        "inkling2_loop_text": "Inkling2ModelConfig",
+    })
+
+    if _CUSTOMIZED_METHOD_TO_QUANT_CONFIG.get("inkling2_fp8") is not Inkling2FP8QuantConfig:
+        # register_quantization_config appends to current_platform.supported_quantization
+        # when the method is new; remove any static pre-entry first to avoid duplicates.
+        if "inkling2_fp8" not in QUANTIZATION_METHODS and "inkling2_fp8" in HpuPlatform.supported_quantization:
+            HpuPlatform.supported_quantization.remove("inkling2_fp8")
+        register_quantization_config("inkling2_fp8")(Inkling2FP8QuantConfig)
+    if "inkling2_fp8" not in HpuPlatform.supported_quantization:
+        HpuPlatform.supported_quantization.append("inkling2_fp8")
+
+
+def _patch_logits_processor_apply_head() -> None:
+    """Honor ``quant_method.supports_out_dtype`` in ``LogitsProcessor._apply_head``.
+
+    Allows ``HPUFp8LMHeadMethod`` (``VLLM_HPU_FP8_LM_HEAD=1``) to emit ``fp32``
+    logits directly from ``fp8_gemm_v2`` without dequantizing ``lm_head`` weights
+    when a model configures ``head_dtype=torch.float32`` (e.g. Inkling2).
+    Self-retires once upstream ``LogitsProcessor._apply_head`` checks
+    ``supports_out_dtype`` natively.
+    """
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    orig = getattr(LogitsProcessor, "_apply_head", None)
+    if orig is None or getattr(orig, "_hpu_out_dtype_patch", False):
+        return
+    try:
+        source = inspect.getsource(orig)
+    except (OSError, TypeError):
+        source = ""
+    if "supports_out_dtype" in source:
+        return
+
+    @functools.wraps(orig)
+    def _hpu_apply_head(self, lm_head, hidden_states, embedding_bias):
+        if (self.head_dtype is not None and self.head_dtype != hidden_states.dtype
+                and getattr(lm_head.quant_method, "supports_out_dtype", False)):
+            return lm_head.quant_method.apply(lm_head,
+                                              hidden_states,
+                                              bias=embedding_bias,
+                                              out_dtype=self.head_dtype)
+        return orig(self, lm_head, hidden_states, embedding_bias)
+
+    _hpu_apply_head._hpu_out_dtype_patch = True  # type: ignore[attr-defined]
+    LogitsProcessor._apply_head = _hpu_apply_head
+
+
+def _patch_v1_dflash_candidate_heads() -> None:
+    """Allow HPU's V1 model runner to serve DFlash candidate-head drafts.
+
+    Upstream ``VllmConfig._get_v1_model_runner_unsupported_features`` rejects
+    DFlash candidate-head drafts unconditionally because upstream only supports
+    them in its V2 GPU runner. Remove that item when the active platform advertises
+    ``supports_v1_dflash_candidate_heads()``.
+    """
+    from vllm.config.vllm import VllmConfig
+
+    orig = getattr(VllmConfig, "_get_v1_model_runner_unsupported_features", None)
+    if orig is None or getattr(orig, "_hpu_dflash_patch", False):
+        return
+    try:
+        source = inspect.getsource(orig)
+    except (OSError, TypeError):
+        source = ""
+    if "supports_v1_dflash_candidate_heads" in source:
+        return
+
+    @functools.wraps(orig)
+    def _hpu_v1_unsupported_features(self) -> list[str]:
+        from vllm.platforms import current_platform
+
+        unsupported = orig(self)
+        if getattr(current_platform, "supports_v1_dflash_candidate_heads", lambda: False)():
+            unsupported = [f for f in unsupported if f != "DFlash candidate-head drafts"]
+        return unsupported
+
+    _hpu_v1_unsupported_features._hpu_dflash_patch = True  # type: ignore[attr-defined]
+    VllmConfig._get_v1_model_runner_unsupported_features = _hpu_v1_unsupported_features
+
+
+def apply_plugin_registrations() -> None:
+    """Idempotent plugin-time registrations and lightweight upstream hooks.
+
+    Invoked from ``vllm_gaudi:register_utils`` (entry point ``01.hpu_custom_utils``)
+    and ``_load_general_with_hpu_patches`` so they are active regardless of how
+    ``load_general_plugins`` was imported.
+    """
+    _patch_inkling2_registrations()
+    _patch_logits_processor_apply_head()
+    _patch_v1_dflash_candidate_heads()
 
 
 def _patch_engine_core_sleep_host_guard() -> None:
@@ -938,7 +1126,9 @@ def apply() -> None:
         _patch_free_blocks()
         _patch_sdpa_attention_forward()
         _patch_inc_quantization_config()
+        apply_plugin_registrations()
         _patch_engine_core_sleep_host_guard()
+        _patch_fp8_gemm_v2_meta()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 

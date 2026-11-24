@@ -1,0 +1,18 @@
+This repository is based on vLLM Hardware Plugin for Intel Gaudi
+(https://github.com/vllm-project/vllm-gaudi), Apache License 2.0,
+starting from commit 827b0092b0143cbe5516eb84cf052902b163560b.
+
+Third-party components included or adapted:
+
+- 1Cat-vLLM-Gaudi (https://github.com/1CatAI/1Cat-vLLM-Gaudi), Apache License 2.0,
+  commit e2266e0efa381e6649e0f25b789cbb61b21b0e1f:
+  adapted into flashinfer_gaudi/, vllm_gaudi/ops/flashinfer_gaudi_adapter.py,
+  vllm_gaudi/v1/worker/gdn_state_layout.py, FlashQLA prefill solver in
+  vllm_gaudi/ops/hpu_gdn_pytorch.py, GDN direct-state decode hooks in
+  vllm_gaudi/models/qwen3_5.py and vllm_gaudi/v1/worker/hpu_model_runner.py,
+  decode-sized CGUID dynamic FP8 quantization in vllm_gaudi/extension/ops.py
+  and vllm_gaudi/models/qwen3_next.py, and related unit tests.
+
+- Habana Labs TPC simulator test helpers (tpc/tests/habana/bfloat16.h,
+  float16.h, float16.cpp, tensor.h), Copyright (c) 2020-2022 Habana Labs,
+  BSD-2-Clause License (headers preserved in each file).

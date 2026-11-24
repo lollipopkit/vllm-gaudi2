@@ -426,3 +426,41 @@ def test_m_rotary_embedding(
     native_rotary_data = RotaryData(cls=MRotaryEmbedding, dtype=torch.bfloat16, device="hpu")
     oot_rotary_data = RotaryData(cls=HPUMRotaryEmbedding, dtype=torch.bfloat16, device="hpu")
     run_rotary_embedding_test(native_rotary_data, oot_rotary_data, seq_length, hidden_size, **kwargs)
+
+
+@pytest.mark.parametrize("native_cls, oot_cls, extra", [
+    (RotaryEmbedding, HPURotaryEmbedding, {}),
+    (LinearScalingRotaryEmbedding, HPULinearScalingRotaryEmbedding, {
+        "scaling_factors": 2.0
+    }),
+])
+def test_unprepared_rotary_keeps_no_cos_sin(default_vllm_config: None, native_cls, oot_cls, extra) -> None:
+    """The model adapter prepares cos / sin for one rotary module per step. Another one (LFM3 / Gemma sliding vs
+    full layers) computes them per call and keeps no state shaped like the step, which would enter the compiled
+    regions' guards; its outputs match the prepared module's."""
+    num_heads, head_size, max_positions = 4, 128, 4096
+    kwargs = {
+        "head_size": head_size,
+        "rotary_dim": 64,
+        "max_position_embeddings": max_positions,
+        "base": 10000.0,
+        "is_neox_style": True,
+        "dtype": torch.bfloat16,
+        **extra
+    }
+    with temporary_op_registry_oot(), torch.device("hpu"):
+        register_op(native_cls, oot_cls)
+        prepared, unprepared = native_cls(**kwargs), native_cls(**kwargs)
+    assert isinstance(unprepared, oot_cls)
+    for seq_length in (16, 32):
+        positions = torch.randint(high=max_positions, size=(1, seq_length), device="hpu")
+        query = torch.randn(1, seq_length, num_heads * head_size, dtype=torch.bfloat16, device="hpu")
+        key = torch.randn(1, seq_length, num_heads * head_size, dtype=torch.bfloat16, device="hpu")
+        prepared.prepare_cos_sin(positions)
+        ref_query, ref_key = prepared(positions, query, key)
+        query_out, key_out = unprepared(positions, query, key)
+        assert not hasattr(unprepared, "cos") and not hasattr(unprepared, "sin")
+        assert prepared.sin.shape[0] == seq_length
+        torch.testing.assert_close(query_out, ref_query, atol=0, rtol=0)
+        torch.testing.assert_close(key_out, ref_key, atol=0, rtol=0)
+        del prepared.cos, prepared.sin  # as the adapter does after the step

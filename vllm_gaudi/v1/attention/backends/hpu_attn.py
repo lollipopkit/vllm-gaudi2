@@ -67,6 +67,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     window_block_list: Optional[torch.Tensor] = None
     image_seg_ids: Optional[torch.Tensor] = None
     indexer_block_index: Optional[torch.Tensor] = None
+    block_logical_idx: Optional[torch.Tensor] = None
 
     def seq_len(self):
         return self.slot_mapping.size(-1)
@@ -140,7 +141,10 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              store_indices_tensor=None,
                              query_start_loc=None,
                              seq_lens_tensor=None,
-                             indexer_block_index=None):
+                             indexer_block_index=None,
+                             direct_gdn_state=False,
+                             gdn_num_accepted=None,
+                             block_logical_idx=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -164,4 +168,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    store_indices_tensor=store_indices_tensor,
                    query_start_loc=query_start_loc,
                    query_start_loc_p=query_start_loc,
-                   indexer_block_index=indexer_block_index)
+                   indexer_block_index=indexer_block_index,
+                   direct_gdn_state=direct_gdn_state,
+                   gdn_num_accepted=gdn_num_accepted,
+                   block_logical_idx=block_logical_idx)

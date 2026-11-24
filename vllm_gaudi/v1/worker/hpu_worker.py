@@ -18,7 +18,8 @@ import habana_frameworks.torch as htorch
 from vllm.tasks import SupportedTask
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
-from vllm_gaudi.extension.profiler import (HabanaMemoryProfiler, format_bytes, setup_profiler)
+from vllm_gaudi.extension.profiler import (HabanaMemoryProfiler, format_bytes,
+                                            make_habana_export_chrome_trace_accept_metadata, setup_profiler)
 from vllm_gaudi.extension.runtime import get_config
 
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -332,27 +333,35 @@ class HPUWorker(WorkerBase):
         )
 
     def init_profiler(self):
-        """Initialize the profiler."""
-        torch_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
-        if torch_profiler_dir:
+        """Initialize the profiler from --profiler-config (profiler=torch), or the deprecated env var."""
+        cfg = self.vllm_config.profiler_config
+        trace_dir, with_stack, record_shapes = None, True, False
+        if cfg is not None and cfg.profiler == "torch" and cfg.torch_profiler_dir:
+            # Honors torch_profiler_with_stack: the python tracer roughly doubles host time per decode step,
+            # which turns a device-bound step into a host-bound one in the trace.
+            trace_dir, with_stack, record_shapes = (cfg.torch_profiler_dir, cfg.torch_profiler_with_stack,
+                                                    cfg.torch_profiler_record_shapes)
+        elif os.getenv('VLLM_TORCH_PROFILER_DIR'):
+            # TODO: remove with VLLM_TORCH_PROFILER_DIR (deprecated upstream).
             logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
-            torch_profiler_trace_dir = torch_profiler_dir
-            logger.info("Profiling enabled. Traces will be saved to: %s", torch_profiler_trace_dir)
-            if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
-                fn = self.model_runner.profiler.full_trace_handler  # type: ignore[union-attr]
-                with_stack = False
-            else:
-                fn = torch.profiler.tensorboard_trace_handler
-                with_stack = True
-            self.profiler = torch.profiler.profile(activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.HPU,
-            ],
-                                                   with_stack=with_stack,
-                                                   on_trace_ready=fn(torch_profiler_trace_dir, use_gzip=True))
-
-        else:
+            trace_dir = os.environ['VLLM_TORCH_PROFILER_DIR']
+        if trace_dir is None:
             self.profiler = None
+            return
+        make_habana_export_chrome_trace_accept_metadata()
+        logger.info("Profiling enabled (with_stack=%s). Traces will be saved to: %s", with_stack, trace_dir)
+        if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
+            fn = self.model_runner.profiler.full_trace_handler  # type: ignore[union-attr]
+            with_stack = False
+        else:
+            fn = torch.profiler.tensorboard_trace_handler
+        self.profiler = torch.profiler.profile(activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.HPU,
+        ],
+                                               with_stack=with_stack,
+                                               record_shapes=record_shapes,
+                                               on_trace_ready=fn(trace_dir, use_gzip=True))
 
     def start_profile(self):
         if self.profiler is None:
@@ -598,17 +607,13 @@ class HPUWorker(WorkerBase):
                 single_kv_block_size_bytes += layer_spec.page_size_bytes
 
             elif isinstance(layer_spec, MambaSpec):
-                dtype0 = layer_spec.dtypes[0]
-                dtype1 = layer_spec.dtypes[1]
-
                 # Use an empty tensor instead of `None`` to force Dynamo to pass
                 # it by reference, rather by specializing on the value ``None``.
-                hpu_ssm_cache = torch.tensor([], dtype=dtype0, device='hpu')
-                hpu_conv_cache = torch.tensor([], dtype=dtype1, device='hpu')
-                hpu_ssm_scales = torch.tensor([], dtype=dtype0, device='hpu')
-                hpu_conv_scales = torch.tensor([], dtype=dtype1, device='hpu')
-
-                kv_caches[layer_name] = (hpu_ssm_cache, hpu_conv_cache, hpu_ssm_scales, hpu_conv_scales)
+                # One tensor per state (conv + ssm for Mamba2 / GDN, conv only for
+                # the LFM short conv), then one scales placeholder per state.
+                states = tuple(torch.tensor([], dtype=d, device='hpu') for d in layer_spec.dtypes)
+                scales = tuple(torch.tensor([], dtype=d, device='hpu') for d in layer_spec.dtypes)
+                kv_caches[layer_name] = states + scales
 
                 single_kv_block_size_bytes += layer_spec.page_size_bytes
             else:

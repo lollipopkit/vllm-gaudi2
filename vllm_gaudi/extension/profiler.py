@@ -409,3 +409,23 @@ def setup_profiler(warmup, active):
                                       record_shapes=False,
                                       with_stack=True)
     return profiler
+
+
+def make_habana_export_chrome_trace_accept_metadata() -> None:
+    """torch>=2.13 calls ``export_chrome_trace(path, metadata)``, but the Habana light activity
+    profiler (HABANA_PROFILE=profile_api_light) replaces torch.autograd.profiler.profile with a
+    subclass whose ``export_chrome_trace(self, path)`` takes no metadata, so /stop_profile fails.
+    Accept and drop the metadata argument."""
+    import inspect
+    cls = torch.autograd.profiler.profile
+    export = cls.export_chrome_trace
+    if getattr(export, "_vllm_gaudi_accepts_metadata", False):
+        return
+    if len(inspect.signature(export).parameters) != 2:
+        return
+
+    def export_chrome_trace(self, path, metadata=None):
+        return export(self, path)
+
+    export_chrome_trace._vllm_gaudi_accepts_metadata = True
+    cls.export_chrome_trace = export_chrome_trace
