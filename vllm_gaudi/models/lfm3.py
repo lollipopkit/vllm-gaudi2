@@ -9,6 +9,7 @@ from itertools import islice
 
 import torch
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.fusion.quant_activation import get_input_quant_key
 from vllm.model_executor.layers.mamba.short_conv import ShortConv
 from vllm_gaudi.models.lfm3_base import Lfm3Attention, Lfm3ForCausalLM, Lfm3Model
 from vllm.sequence import IntermediateTensors
@@ -52,6 +53,47 @@ class HpuLfm3Model(LayerGroupModel, Lfm3Model):
     def hpu_layer_group_final_norm(self) -> torch.nn.Module | None:
         return self.embedding_norm if get_pp_group().is_last_rank else None
 
+    def hpu_layer_kinds(self) -> tuple | None:
+        base_kinds = super().hpu_layer_kinds()
+        layers = tuple(islice(self.layers, self.start_layer, self.end_layer))
+        if base_kinds is None:
+            base_kinds = tuple(layer.is_attention_layer for layer in layers)
+        # Include ShortConv layer ordinal (`None if layer.is_attention_layer else idx`) so groups
+        # containing different ShortConv layers never share a `forward_v*` code object under static_modules.
+        return tuple((
+            k,
+            None if layer.is_attention_layer else idx,
+            getattr(layer, "_hpu_fuse_op_norm_f8", 0),
+            getattr(layer, "_hpu_fuse_ffn_norm_f8", 0),
+            getattr(getattr(layer, "short_conv", None), "_use_tpc_short_conv", False),
+            get_input_quant_key(layer.feed_forward.w2),
+        ) for idx, (k, layer) in enumerate(zip(base_kinds, layers)))
+
+    def _ensure_short_conv_group_ints(self) -> None:
+        if getattr(self, "_hpu_short_conv_group_ints_ready", False):
+            return
+        # Only populate `_decode_group_int` when decode runs 100% through compiled
+        # `DecoderLayerGroup`s (distinct code object per ShortConv group, no max_batch_size fallback).
+        if (
+            getattr(self, "_hpu_compiled_layer_groups", None) is None
+            or getattr(self, "_hpu_layer_group_max_batch_size", None) is not None
+        ):
+            object.__setattr__(self, "_hpu_short_conv_group_ints_ready", True)
+            return
+        ready = True
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            sc = getattr(layer, "short_conv", None)
+            if sc is None:
+                continue
+            cg = getattr(sc, "cache_group_idx", None)
+            if cg is None:
+                ready = False
+                break
+            if getattr(sc, "_decode_group_int", None) is None:
+                sc._decode_group_int = int(cg.item())
+        if ready:
+            object.__setattr__(self, "_hpu_short_conv_group_ints_ready", True)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -59,6 +101,7 @@ class HpuLfm3Model(LayerGroupModel, Lfm3Model):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        self._ensure_short_conv_group_ints()
         if get_pp_group().is_first_rank:
             hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
             residual = None

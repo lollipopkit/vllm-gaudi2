@@ -21,6 +21,8 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_t
 from vllm.model_executor.kernels.linear import _POSSIBLE_FP8_BLOCK_KERNELS, _POSSIBLE_FP8_KERNELS
 from vllm.platforms import PlatformEnum
 from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
+from vllm.model_executor.layers.fusion.quant_activation import as_quantized_activation
+from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym
 from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     ChannelWiseTorchFP8ScaledMMLinearKernel,
@@ -175,10 +177,18 @@ class Fp8LinearMethod(OrigFp8LinearMethod):
             kwargs['weight_loader'] = hpu_ops.gaudi_weight_wrapper(kwargs.get('weight_loader'))
         super().create_weights(*args, **kwargs)
 
+    def _maybe_expose_dynamic_fp8_key(self, layer: torch.nn.Module) -> None:
+        if (hpu_ops.is_hpu_gaudi2 and getattr(layer, "weight", None) is not None
+                and layer.weight.dtype == torch.float8_e4m3fn and getattr(layer, "input_scale", None) is None
+                and (not self.block_quant or envs.VLLM_HPU_FORCE_CHANNEL_FP8)
+                and getattr(layer, "input_is_parallel", True)):
+            layer._input_quant_key = kFp8DynamicTokenSym
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.quant_config = self.quant_config
         if self.block_quant:
             layer = hpu_ops.fp8_block_linear_postprocess_weights(layer, envs.VLLM_HPU_FORCE_CHANNEL_FP8)
+            self._maybe_expose_dynamic_fp8_key(layer)
             return
         # If checkpoint not serialized fp8, quantize the weights.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
@@ -209,6 +219,7 @@ class Fp8LinearMethod(OrigFp8LinearMethod):
         layer.weight = Parameter(weight.data, requires_grad=False)
         layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
         layer.input_scale = (Parameter(input_scale, requires_grad=False) if input_scale is not None else None)
+        self._maybe_expose_dynamic_fp8_key(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.block_quant:
@@ -223,6 +234,16 @@ class Fp8LinearMethod(OrigFp8LinearMethod):
             )
 
         weight_scale = layer.weight_scale.transpose(0, 1) if layer.weight_scale.dim() > 1 else layer.weight_scale
+        qa = as_quantized_activation(x, kFp8DynamicTokenSym)
+        if qa is not None:
+            output = hpu_ops.apply_prequant_fp8_linear_hpu(qa.data.view(-1, qa.data.shape[-1]),
+                                                           qa.scale.view(-1, 1),
+                                                           weight=layer.weight,
+                                                           weight_scale=weight_scale,
+                                                           bias=bias,
+                                                           trans_B=False,
+                                                           out_dtype=qa.orig_dtype)
+            return output.view(*qa.orig_shape[:-1], -1)
         input_scale = getattr(layer, 'input_scale', None)
         input_2d = x.view(-1, x.shape[-1])
         output = hpu_ops.apply_fp8_linear_hpu(input=input_2d,

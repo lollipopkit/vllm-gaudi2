@@ -1,9 +1,10 @@
 # Gaudi2 Custom TPC-C Kernels
 
-19 custom Gaudi2 TPC-C kernels packaged into `libgaudi2_tpc_proxy.so` (wraps `/usr/lib/habanalabs/libtpc_kernels.so` with full layout forwarding behind a single `GC_KERNEL_PATH` file so Synapse recipe caching works):
+25 custom Gaudi2 TPC-C kernels packaged into `libgaudi2_tpc_proxy.so` (wraps `/usr/lib/habanalabs/libtpc_kernels.so` with full layout forwarding behind a single `GC_KERNEL_PATH` file so Synapse recipe caching works):
 
 - **Qwen3.8 GDN (2 GUIDs)**: `gdn_decode_f32_gaudi2`, `gdn_verify_f32_gaudi2` (single-pass recurrent state update on KV-major `[B, HV, K, V]` pool).
-- **Inkling 2 Mini (17 GUIDs)**: split-K BF16 MoE gate GEMV + top-k, 4-bucket expert grouping + FP8 `w13`/`w2` GEMV, fused MoE sum + short-conv epilogue, `qkvr_prep`, `sconv_static`, paged relative-bias attention + gate-sink (with GQA-3 shared-K/V fast path), Block AttnRes (`f32`/`bf16`/`f8`), and loop blend/pair RMSNorm kernels.
+- **Fused FP8 / GDN Prep & Post / LFM3 ShortConv (6 GUIDs)**: `gaudi2_add_rms_norm_f8_gaudi2` (3-out & 4-out, BF16/FP32 weights), `gaudi2_sandwich_rms_norm_f8_gaudi2`, `gaudi2_silu_mul_f8_gaudi2`, `gdn_prep_decode_gaudi2`, `gdn_gated_rms_norm_f8_gaudi2`, and pure-functional 2-output `lfm3_short_conv_decode_gaudi2`.
+- **Inkling 2 Mini (17 GUIDs)**: split-K BF16 MoE gate GEMV + top-k, 4-bucket expert grouping + FP8 `w13`/`w2` GEMV, fused MoE sum + short-conv epilogue (with optional 8-input full-state packing), `qkvr_prep`, `sconv_static`, paged relative-bias attention + gate-sink (with GQA-3 shared-K/V fast path), Block AttnRes (`f32`/`bf16`/`f8`), and loop blend/pair RMSNorm kernels.
 
 ## Build & Test
 
@@ -15,6 +16,7 @@ cmake -S tpc -B tpc/build && make -C tpc/build -j
 
 # Run simulator tests (pass TPC_RUNNER=1 to run on Gaudi2 hardware)
 LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/gdn_decode_test 6 2
+LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/gaudi2_fp8_ops_test
 LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/inkling2_attn_res_test
 LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/inkling2_ops_test
 LD_LIBRARY_PATH=/usr/lib/habanatools tpc/build/inkling2_moe_test

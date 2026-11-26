@@ -118,6 +118,7 @@ def register_ops():
     import vllm_gaudi.ops.hpu_modelopt  # noqa: F401
     import vllm_gaudi.ops.hpu_compressed_tensors  # noqa: F401
     import vllm_gaudi.ops.hpu_fp8  # noqa: F401
+    import vllm_gaudi.ops.hpu_gaudi2_fp8_tpc  # noqa: F401
     import vllm_gaudi.ops.hpu_mxfp4  # noqa: F401
     import vllm_gaudi.ops.hpu_gptq  # noqa: F401
     import vllm_gaudi.ops.hpu_awq  # noqa: F401

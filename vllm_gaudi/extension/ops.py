@@ -21,6 +21,8 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization import get_quantization_config as vllm_get_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.fusion.quant_activation import as_quantized_activation
+from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym
 import vllm_gaudi.envs as gaudi_envs
 
 is_hpu_gaudi2 = htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi2
@@ -957,6 +959,18 @@ def apply_block_fp8_linear_hpu(
     force_channel_fp8: bool = False,
 ) -> torch.Tensor:
     if force_channel_fp8:
+        qa = as_quantized_activation(input, kFp8DynamicTokenSym)
+        if qa is not None:
+            output = apply_prequant_fp8_linear_hpu(
+                qa.data.view(-1, qa.data.shape[-1]),
+                qa.scale.view(-1, 1),
+                layer.weight,
+                layer.weight_scale_inv,
+                bias=bias,
+                trans_B=True,
+                out_dtype=qa.orig_dtype,
+            )
+            return output.view(*qa.orig_shape[:-1], -1)
         input_2d = input.view(-1, input.shape[-1])
         output = apply_fp8_linear_hpu(
             input_2d,
@@ -1002,6 +1016,29 @@ def apply_block_fp8_linear_hpu_dequant(
     return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
 
 
+def apply_prequant_fp8_linear_hpu(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    trans_B: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+):
+    if bias is not None and bias.dtype != out_dtype:
+        bias = bias.to(out_dtype)
+    return torch.ops.hpu.fp8_gemm_v2(A=x_fp8,
+                                     trans_A=False,
+                                     B=weight,
+                                     trans_B=trans_B,
+                                     D=None,
+                                     out_dtype=out_dtype,
+                                     A_scale_inv=x_scale,
+                                     B_scale_inv=weight_scale,
+                                     bias=bias,
+                                     accumulate=False)
+
+
 def apply_fp8_linear_hpu(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1018,19 +1055,8 @@ def apply_fp8_linear_hpu(
         x_fp8 = torch.ops.hpu.cast_to_fp8_v2(input, 1.0 / input_scale, False, False, torch.float8_e4m3fn)[0]
         x_scale = input_scale
     resolved_dtype = out_dtype or input.dtype
-    if bias is not None and bias.dtype != resolved_dtype:
-        bias = bias.to(resolved_dtype)
-    output = torch.ops.hpu.fp8_gemm_v2(A=x_fp8,
-                                       trans_A=False,
-                                       B=weight,
-                                       trans_B=trans_B,
-                                       D=None,
-                                       out_dtype=resolved_dtype,
-                                       A_scale_inv=x_scale,
-                                       B_scale_inv=weight_scale,
-                                       bias=bias,
-                                       accumulate=False)
-    return output
+    return apply_prequant_fp8_linear_hpu(x_fp8, x_scale, weight, weight_scale, bias=bias, trans_B=trans_B,
+                                         out_dtype=resolved_dtype)
 
 
 # Derived from 1CatAI/1Cat-vLLM-Gaudi (Apache-2.0) at e2266e0. Resolved at import

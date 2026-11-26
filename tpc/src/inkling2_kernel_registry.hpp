@@ -4,6 +4,7 @@
 
 #include <cstring>
 
+#include "gaudi2_fp8_ops_gaudi2.hpp"
 #include "gdn_decode_gaudi2.hpp"
 #include "gdn_verify_gaudi2.hpp"
 #include "inkling2_attn_res_gaudi2.hpp"
@@ -14,6 +15,12 @@
 #define GAUDI2_TPC_KERNELS(X)                   \
     X(GdnDecodeGaudi2)                          \
     X(GdnVerifyGaudi2)                          \
+    X(Gaudi2AddRmsNormF8Gaudi2)                 \
+    X(Gaudi2SandwichRmsNormF8Gaudi2)            \
+    X(Gaudi2SiluMulF8Gaudi2)                    \
+    X(GdnPrepDecodeGaudi2)                      \
+    X(GdnGatedRmsNormF8Gaudi2)                  \
+    X(Lfm3ShortConvDecodeGaudi2)                \
     X(Inkling2MoeW13SituGaudi2)                 \
     X(Inkling2MoeW2Gaudi2)                      \
     X(Inkling2AttnResNormBf16Gaudi2)            \

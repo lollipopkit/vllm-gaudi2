@@ -14,6 +14,9 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
+from vllm.config.model import LogprobsMode
+from vllm.v1.outputs import SamplerOutput
+from vllm_gaudi.ops import hpu_sampler
 from vllm_gaudi.v1._vendored.sample.metadata import SamplingMetadata
 from vllm_gaudi.v1._vendored.sample.sampler import Sampler
 
@@ -154,12 +157,89 @@ def apply_penalties_from_stats(logits: torch.Tensor, prompt_mask: torch.Tensor, 
     return logits - presence_penalties.unsqueeze(1) * output_mask
 
 
+def _fast_greedy(logits: torch.Tensor) -> torch.Tensor:
+    return logits.argmax(dim=-1).to(torch.int32).unsqueeze(-1)
+
+
+def _fast_greedy_pen(logits: torch.Tensor, prompt_mask: torch.Tensor, output_counts: torch.Tensor,
+                     pres_p: torch.Tensor, freq_p: torch.Tensor, rep_p: torch.Tensor) -> torch.Tensor:
+    logits_f = apply_penalties_from_stats(logits.float(), prompt_mask, output_counts, pres_p, freq_p, rep_p)
+    return logits_f.argmax(dim=-1).to(torch.int32).unsqueeze(-1)
+
+
+def _scale_centered_by_temp(logits_f: torch.Tensor, temp: torch.Tensor) -> torch.Tensor:
+    peak = logits_f.amax(dim=-1, keepdim=True)
+    return (logits_f - torch.where(peak.isfinite(), peak, 0.0)) / temp.clamp(min=1e-7).unsqueeze(1)
+
+
+def _fast_random(logits: torch.Tensor, temp: torch.Tensor) -> torch.Tensor:
+    scaled = _scale_centered_by_temp(logits.float(), temp)
+    return hpu_sampler.gumbel_argmax(scaled, pre_centered=True).to(torch.int32).unsqueeze(-1)
+
+
+def _fast_random_pen(logits: torch.Tensor, prompt_mask: torch.Tensor, output_counts: torch.Tensor,
+                     pres_p: torch.Tensor, freq_p: torch.Tensor, rep_p: torch.Tensor,
+                     temp: torch.Tensor) -> torch.Tensor:
+    logits_f = apply_penalties_from_stats(logits.float(), prompt_mask, output_counts, pres_p, freq_p, rep_p)
+    scaled = _scale_centered_by_temp(logits_f, temp)
+    return hpu_sampler.gumbel_argmax(scaled, pre_centered=True).to(torch.int32).unsqueeze(-1)
+
+
+def _fast_topk(logits: torch.Tensor, temp: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    vals, idx = hpu_sampler.capped_candidates(logits, k, None, hpu_sampler.TOPK_CAP, temp=temp)
+    choice = hpu_sampler.gumbel_argmax(vals, pre_centered=True)
+    return idx.gather(1, choice.unsqueeze(1)).to(torch.int32)
+
+
+def _fast_topk_pen(logits: torch.Tensor, prompt_mask: torch.Tensor, output_counts: torch.Tensor,
+                   pres_p: torch.Tensor, freq_p: torch.Tensor, rep_p: torch.Tensor, temp: torch.Tensor,
+                   k: torch.Tensor) -> torch.Tensor:
+    logits_f = apply_penalties_from_stats(logits.float(), prompt_mask, output_counts, pres_p, freq_p, rep_p)
+    vals, idx = hpu_sampler.capped_candidates(logits_f, k, None, hpu_sampler.TOPK_CAP, temp=temp)
+    choice = hpu_sampler.gumbel_argmax(vals, pre_centered=True)
+    return idx.gather(1, choice.unsqueeze(1)).to(torch.int32)
+
+
+def _fast_topk_topp(logits: torch.Tensor, temp: torch.Tensor, k: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    vals, idx = hpu_sampler.capped_candidates(logits, k, p, hpu_sampler.TOPK_CAP, temp=temp)
+    choice = hpu_sampler.gumbel_argmax(vals, pre_centered=True)
+    return idx.gather(1, choice.unsqueeze(1)).to(torch.int32)
+
+
+def _fast_topk_topp_pen(logits: torch.Tensor, prompt_mask: torch.Tensor, output_counts: torch.Tensor,
+                        pres_p: torch.Tensor, freq_p: torch.Tensor, rep_p: torch.Tensor, temp: torch.Tensor,
+                        k: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    logits_f = apply_penalties_from_stats(logits.float(), prompt_mask, output_counts, pres_p, freq_p, rep_p)
+    vals, idx = hpu_sampler.capped_candidates(logits_f, k, p, hpu_sampler.TOPK_CAP, temp=temp)
+    choice = hpu_sampler.gumbel_argmax(vals, pre_centered=True)
+    return idx.gather(1, choice.unsqueeze(1)).to(torch.int32)
+
+
 class HpuSampler(Sampler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._penalty_fn: Callable[..., torch.Tensor] = apply_penalties_from_stats
         self._penalty_fn_compiled = False
+        self._fast_compiled = False
+        self._fallback_fn: Optional[Callable[..., SamplerOutput]] = None
+        self._greedy_fn: Callable[..., torch.Tensor] = _fast_greedy
+        self._greedy_pen_fn: Callable[..., torch.Tensor] = _fast_greedy_pen
+        self._random_fn: Callable[..., torch.Tensor] = _fast_random
+        self._random_pen_fn: Callable[..., torch.Tensor] = _fast_random_pen
+        self._topk_fn: Callable[..., torch.Tensor] = _fast_topk
+        self._topk_pen_fn: Callable[..., torch.Tensor] = _fast_topk_pen
+        self._topk_topp_fn: Callable[..., torch.Tensor] = _fast_topk_topp
+        self._topk_topp_pen_fn: Callable[..., torch.Tensor] = _fast_topk_topp_pen
+
+    def _run_fallback_forward(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        predict_bonus_token: bool = False,
+        logprobs_mode_override: Optional[LogprobsMode] = None,
+    ) -> SamplerOutput:
+        return super().forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
 
     def compile_penalties(self, compile_fn: Callable) -> None:
         """One fused kernel: 0.26 ms against 1.6 ms eager on HPU for 8 x 128K. The logits-processor stage that
@@ -167,14 +247,131 @@ class HpuSampler(Sampler):
         self._penalty_fn = compile_fn(apply_penalties_from_stats)
         self._penalty_fn_compiled = True
 
-    def warmup_penalties(self, stats: HpuPenaltyStats, num_rows: int) -> None:
-        """Compile for one batch size with the tensor layout of a real step (HpuPenaltyStats.gather)."""
+    def compile_sampler(self, compile_fn: Callable) -> None:
+        """Compile pure-tensor single-graph fast paths (zero outer SamplingMetadata Dynamo guards or graph breaks)
+        plus the general fallback Sampler.forward."""
+        self.compile_penalties(compile_fn)
+        self._greedy_fn = compile_fn(_fast_greedy)
+        self._greedy_pen_fn = compile_fn(_fast_greedy_pen)
+        self._random_fn = compile_fn(_fast_random)
+        self._random_pen_fn = compile_fn(_fast_random_pen)
+        self._topk_fn = compile_fn(_fast_topk)
+        self._topk_pen_fn = compile_fn(_fast_topk_pen)
+        self._topk_topp_fn = compile_fn(_fast_topk_topp)
+        self._topk_topp_pen_fn = compile_fn(_fast_topk_topp_pen)
+        self._fallback_fn = compile_fn(self._run_fallback_forward, fullgraph=False)
+        self._fast_compiled = True
+
+    def warmup_penalties(self,
+                         stats: HpuPenaltyStats,
+                         num_rows: int,
+                         logits_dtype: torch.dtype = torch.float32) -> None:
+        """Compile penalty kernels for one batch size with the tensor layout and dtype of a real step."""
         if not self._penalty_fn_compiled:
             return
         mask, counts = stats.gather([0] * num_rows)
-        logits = torch.zeros(num_rows, stats.vocab_size, dtype=torch.float32, device=stats.device)
+        logits_f32 = torch.zeros(num_rows, stats.vocab_size, dtype=torch.float32, device=stats.device)
         p = torch.zeros(num_rows, dtype=torch.float32, device=stats.device)
-        self._penalty_fn(logits, mask, counts, p, p, p + 1)
+        rep = p + 1.0
+        self._penalty_fn(logits_f32, mask, counts, p, p, rep)
+        if self._fast_compiled:
+            logits = (logits_f32 if logits_dtype == torch.float32 else torch.zeros(
+                num_rows, stats.vocab_size, dtype=logits_dtype, device=stats.device))
+            temp = torch.ones(num_rows, dtype=torch.float32, device=stats.device)
+            top_p = torch.full((num_rows, ), 0.9, dtype=torch.float32, device=stats.device)
+            top_k = torch.full((num_rows, ), min(50, max(1, stats.vocab_size)), dtype=torch.int32, device=stats.device)
+            self._greedy_pen_fn(logits, mask, counts, p, p, rep)
+            self._random_pen_fn(logits, mask, counts, p, p, rep, temp)
+            if hpu_sampler.TOPK_CAP > 0 and stats.vocab_size >= hpu_sampler.TOPK_CAP:
+                self._topk_pen_fn(logits, mask, counts, p, p, rep, temp, top_k)
+                self._topk_topp_pen_fn(logits, mask, counts, p, p, rep, temp, top_k, top_p)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        predict_bonus_token: bool = False,
+        logprobs_mode_override: Optional[LogprobsMode] = None,
+    ) -> SamplerOutput:
+        if (self._fast_compiled and not predict_bonus_token and sampling_metadata.max_num_logprobs is None
+                and not sampling_metadata.logprob_token_ids and sampling_metadata.allowed_token_ids_mask is None
+                and not sampling_metadata.bad_words_token_ids
+                and not sampling_metadata.logitsprocs.non_argmax_invariant
+                and not sampling_metadata.logitsprocs.argmax_invariant and not sampling_metadata.generators
+                and not self.use_fp64_gumbel):
+            holder = sampling_metadata.thinking_budget_state_holder
+            if holder is None or not holder.has_tracked_requests():
+                no_pen = sampling_metadata.no_penalties
+                prompt_mask = getattr(sampling_metadata, "penalty_prompt_mask", None)
+                if no_pen or prompt_mask is not None:
+                    sampled: Optional[torch.Tensor] = None
+                    if sampling_metadata.all_greedy:
+                        if no_pen:
+                            sampled = self._greedy_fn(logits)
+                        else:
+                            sampled = self._greedy_pen_fn(
+                                logits,
+                                prompt_mask,
+                                sampling_metadata.penalty_output_counts,
+                                sampling_metadata.presence_penalties,
+                                sampling_metadata.frequency_penalties,
+                                sampling_metadata.repetition_penalties,
+                            )
+                    elif sampling_metadata.all_random and sampling_metadata.temperature is not None:
+                        temp = sampling_metadata.temperature
+                        k = sampling_metadata.top_k
+                        p = sampling_metadata.top_p
+                        cap = getattr(self.topk_topp_sampler, "hpu_topk_cap", None)
+                        if k is None and p is None:
+                            if no_pen:
+                                sampled = self._random_fn(logits, temp)
+                            else:
+                                sampled = self._random_pen_fn(
+                                    logits,
+                                    prompt_mask,
+                                    sampling_metadata.penalty_output_counts,
+                                    sampling_metadata.presence_penalties,
+                                    sampling_metadata.frequency_penalties,
+                                    sampling_metadata.repetition_penalties,
+                                    temp,
+                                )
+                        elif (cap is not None and cap == hpu_sampler.TOPK_CAP and logits.shape[-1] >= cap
+                              and k is not None):
+                            if p is None:
+                                if no_pen:
+                                    sampled = self._topk_fn(logits, temp, k)
+                                else:
+                                    sampled = self._topk_pen_fn(
+                                        logits,
+                                        prompt_mask,
+                                        sampling_metadata.penalty_output_counts,
+                                        sampling_metadata.presence_penalties,
+                                        sampling_metadata.frequency_penalties,
+                                        sampling_metadata.repetition_penalties,
+                                        temp,
+                                        k,
+                                    )
+                            else:
+                                if no_pen:
+                                    sampled = self._topk_topp_fn(logits, temp, k, p)
+                                else:
+                                    sampled = self._topk_topp_pen_fn(
+                                        logits,
+                                        prompt_mask,
+                                        sampling_metadata.penalty_output_counts,
+                                        sampling_metadata.presence_penalties,
+                                        sampling_metadata.frequency_penalties,
+                                        sampling_metadata.repetition_penalties,
+                                        temp,
+                                        k,
+                                        p,
+                                    )
+                    if sampled is not None:
+                        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+
+        if self._fallback_fn is not None:
+            return self._fallback_fn(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
+        return super().forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
 
     def apply_penalties(self, logits: torch.Tensor, sampling_metadata: SamplingMetadata,
                         output_token_ids: list[list[int]]) -> torch.Tensor:

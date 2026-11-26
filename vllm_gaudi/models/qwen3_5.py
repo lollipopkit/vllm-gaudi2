@@ -1,11 +1,15 @@
 import torch
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation, get_input_quant_key
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
+from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym
 from vllm.forward_context import get_forward_context
 
+import vllm_gaudi.extension.ops as hpu_ops
 from vllm_gaudi.ops.causal_conv1d_pytorch import (
     hpu_causal_conv1d_fn,
     hpu_causal_conv1d_update,
 )
+from vllm_gaudi.ops.hpu_gaudi2_fp8_tpc import has_gdn_gated_rms_norm_f8, has_gdn_prep_decode
 from vllm_gaudi.ops.hpu_gdn_pytorch import (
     _l2norm_last_dim,
     hpu_chunk_gated_delta_rule,
@@ -59,6 +63,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.neg_exp_A = None
         self.dt_bias_f32 = None
         self.conv_bias_f32 = None
+        self._conv_bias_dummy = None
+        self._norm_weight_f32 = None
+        self._use_tpc_gdn_prep = False
+        self._use_tpc_gdn_gated_norm = False
+        self._ba_consumes_prequant = False
 
         # mamba_chunk_size: use explicit config value or default to 128
         # for HPU bucket alignment.
@@ -79,6 +88,38 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self.dt_bias_f32 = self.dt_bias.to(torch.float32).contiguous()
             if self.conv1d.bias is not None:
                 self.conv_bias_f32 = self.conv1d.bias.to(torch.float32).contiguous()
+        num_v_heads_local = self.num_v_heads // self.tp_size
+        self._use_tpc_gdn_prep = (
+            self.gdn_flashinfer_fused_decode
+            and hpu_gdn_tpc.STATE_KV
+            and has_gdn_prep_decode()
+            and self.conv_taps is not None
+            and self.conv_taps.shape[0] == 4
+            and self.activation in ("silu", "swish")
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+            and self.num_v_heads == 3 * self.num_k_heads
+            and num_v_heads_local <= 64
+        )
+        if self._use_tpc_gdn_prep and self.conv_bias_f32 is None:
+            self._conv_bias_dummy = torch.zeros(
+                self.conv_taps.shape[1], dtype=torch.float32, device=self.conv_taps.device
+            )
+        self._use_tpc_gdn_gated_norm = (
+            has_gdn_gated_rms_norm_f8()
+            and get_input_quant_key(self.out_proj) == kFp8DynamicTokenSym
+            and self.head_v_dim == 128
+            and num_v_heads_local <= 128
+            and getattr(self.norm, "group_size", None) is None
+            and getattr(self.norm, "bias", None) is None
+            and getattr(self.norm, "norm_before_gate", True)
+            and getattr(self.norm, "activation", "silu") in ("silu", "swish")
+        )
+        if self._use_tpc_gdn_gated_norm:
+            self._norm_weight_f32 = self.norm.weight.float().contiguous()
+        self._ba_consumes_prequant = (
+            hasattr(self, "in_proj_ba") and get_input_quant_key(self.in_proj_ba) == kFp8DynamicTokenSym
+        )
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Pure-torch rearrange – avoids einops graph breaks on HPU."""
@@ -232,6 +273,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prequant_f8: torch.Tensor | None = None,
+        prequant_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """HPU compile-friendly GDN forward.
 
@@ -263,8 +306,19 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             z, _ = self.in_proj_z(hidden_states)
             b, a = ba.chunk(2, dim=-1)
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            if prequant_f8 is not None and prequant_scale is not None:
+                qkvz_in = QuantizedActivation(
+                    data=prequant_f8,
+                    scale=prequant_scale,
+                    orig_dtype=hidden_states.dtype,
+                    orig_shape=(num_tokens, hidden_states.size(-1)),
+                    quant_key=kFp8DynamicTokenSym,
+                )
+            else:
+                qkvz_in = hidden_states
+            mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
+            ba, _ = self.in_proj_ba(qkvz_in if (self._ba_consumes_prequant and qkvz_in is not hidden_states)
+                                    else hidden_states)
 
             if self.gqa_interleaved_layout:
                 # Qwen3-Next: unpack the interleaved GQA layout with explicit head dims (avoid HPU -1 -> 0 reshape)
@@ -395,25 +449,79 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 decode_result = (self._spec_verify(mixed_qkv, a, b, conv_state, conv_weights, ssm_state, state_indices,
                                                    store_indices, num_accepted, num_decodes, spec_tokens), )
             if decode_result is None and direct_gdn_state and self.conv_taps is not None:
-                # Gating, conv and recurrence in one graph on contiguous
-                # group-major state views (no index_select/index_copy).
-                decode_result = maybe_run_gdn_fused_decode_step(
-                    mixed_qkv,
-                    a,
-                    b,
-                    self.A_log,
-                    self.dt_bias,
-                    conv_state,
-                    self.conv_taps,
-                    self.conv1d.bias,
-                    ssm_state,
-                    direct_state_group_count=self.compact_state_group_count,
-                    direct_state_group_offset=self.compact_state_group_offset,
-                    scale=self.head_k_dim**-0.5,
-                    neg_exp_A=self.neg_exp_A,
-                    dt_bias_f32=self.dt_bias_f32,
-                    conv_bias_f32=self.conv_bias_f32,
-                )
+                group_count = self.compact_state_group_count
+                group_offset = self.compact_state_group_offset
+                if (self._use_tpc_gdn_prep and group_count is not None and group_count > 0
+                        and group_offset is not None and 0 <= group_offset < group_count
+                        and conv_state.ndim == 3 and conv_state.shape[1] >= 3 and conv_state.is_contiguous()
+                        and conv_state.dtype == torch.bfloat16 and ssm_state.ndim == 4
+                        and ssm_state.is_contiguous() and ssm_state.dtype == torch.float32
+                        and tuple(ssm_state.shape[2:]) == (128, 128)
+                        and conv_state.shape[0] == ssm_state.shape[0]
+                        and mixed_qkv.dtype == torch.bfloat16 and a.dtype == torch.bfloat16
+                        and b.dtype == torch.bfloat16 and mixed_qkv.shape[1] == conv_state.shape[2]
+                        and a.shape[1] == ssm_state.shape[1] and b.shape[1] == ssm_state.shape[1]):
+                    span, rem = divmod(ssm_state.shape[0] - 2, group_count)
+                    if rem == 0 and 0 < num_tokens <= span:
+                        row_offset = group_offset * span + 1
+                        conv_col_offset = conv_state.shape[1] - 3
+                        has_bias = 1 if self.conv_bias_f32 is not None else 0
+                        bias_t = self.conv_bias_f32 if has_bias else self._conv_bias_dummy
+                        qk, v, decay, beta, kqdot = torch.ops.custom_op.gdn_prep_decode(
+                            mixed_qkv.contiguous(),
+                            a.contiguous(),
+                            b.contiguous(),
+                            self.neg_exp_A,
+                            self.dt_bias_f32,
+                            conv_state,
+                            self.conv_taps,
+                            bias_t,
+                            row_offset,
+                            conv_col_offset,
+                            has_bias,
+                        )
+                        out_f32 = torch.ops.custom_op.gdn_decode(
+                            ssm_state, qk, v, decay, beta, kqdot, row_offset, self.head_k_dim**-0.5
+                        )
+                        if self._use_tpc_gdn_gated_norm and z.dtype == torch.bfloat16:
+                            z_2d = z.reshape(num_tokens, num_v_heads_local * self.head_v_dim).contiguous()
+                            out_f8, out_sc = torch.ops.custom_op.gdn_gated_rms_norm_f8(
+                                out_f32,
+                                z_2d,
+                                self._norm_weight_f32,
+                                float(self.norm.eps),
+                                float(hpu_ops.FP8_MAX),
+                            )
+                            qa = QuantizedActivation(
+                                data=out_f8,
+                                scale=out_sc,
+                                orig_dtype=hidden_states.dtype,
+                                orig_shape=(num_tokens, num_v_heads_local * self.head_v_dim),
+                                quant_key=kFp8DynamicTokenSym,
+                            )
+                            output, _ = self.out_proj(qa)
+                            return output.view(orig_shape)
+                        decode_result = (out_f32.to(hidden_states.dtype).unsqueeze(0), ssm_state)
+                if decode_result is None:
+                    # Gating, conv and recurrence in one graph on contiguous
+                    # group-major state views (no index_select/index_copy).
+                    decode_result = maybe_run_gdn_fused_decode_step(
+                        mixed_qkv,
+                        a,
+                        b,
+                        self.A_log,
+                        self.dt_bias,
+                        conv_state,
+                        self.conv_taps,
+                        self.conv1d.bias,
+                        ssm_state,
+                        direct_state_group_count=group_count,
+                        direct_state_group_offset=group_offset,
+                        scale=self.head_k_dim**-0.5,
+                        neg_exp_A=self.neg_exp_A,
+                        dt_bias_f32=self.dt_bias_f32,
+                        conv_bias_f32=self.conv_bias_f32,
+                    )
             if decode_result is None:
                 g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 

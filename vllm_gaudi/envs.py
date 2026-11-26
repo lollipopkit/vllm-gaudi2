@@ -31,6 +31,16 @@ if TYPE_CHECKING:
     VLLM_HPU_SAMPLER_TOPK_CAP: int = 64
     VLLM_HPU_GDN_PREFILL_TUNING: str = ""
     VLLM_HPU_GDN_TPC_DECODE: bool = False
+    VLLM_HPU_GAUDI2_FP8_TPC: bool = True
+    VLLM_HPU_GAUDI2_FP8_TPC_TORCH_LIB: str = ""
+    VLLM_HPU_GAUDI2_FP8_TPC_MIN_ROWS: int = 1
+    VLLM_HPU_GAUDI2_FP8_TPC_MAX_ROWS: int = 64
+    VLLM_HPU_TPC_ADD_RMS_NORM_F8: bool = True
+    VLLM_HPU_TPC_SANDWICH_RMS_NORM_F8: bool = True
+    VLLM_HPU_TPC_SILU_MUL_F8: bool = True
+    VLLM_HPU_TPC_GDN_PREP: bool = True
+    VLLM_HPU_TPC_GDN_GATED_NORM_F8: bool = True
+    VLLM_HPU_TPC_LFM3_SHORT_CONV: bool = True
     VLLM_HPU_LFM3_PACKED_TOWER: bool = True
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_VIT_DP: bool = False
@@ -179,6 +189,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Needs the fused direct-state decode and the kernel library on GC_KERNEL_PATH.
     "VLLM_HPU_GDN_TPC_DECODE":
     lambda: _bool_env("VLLM_HPU_GDN_TPC_DECODE", "false"),
+    # Custom Gaudi2 FP8/GDN/ShortConv TPC kernels (tpc/): fused Add+RMSNorm+FP8, SandwichRMSNorm+FP8,
+    # SiluAndMul+FP8, GDN prep/gated-norm, and LFM3 ShortConv decode. Activates only on Gaudi2 when the
+    # custom kernel library is on GC_KERNEL_PATH and tpc/torch/gaudi2_fp8_tpc*.so is built.
+    "VLLM_HPU_GAUDI2_FP8_TPC":
+    lambda: _bool_env("VLLM_HPU_GAUDI2_FP8_TPC", "true"),
+    # Optional explicit path to tpc/torch/gaudi2_fp8_tpc*.so.
+    "VLLM_HPU_GAUDI2_FP8_TPC_TORCH_LIB":
+    lambda: os.environ.get("VLLM_HPU_GAUDI2_FP8_TPC_TORCH_LIB", ""),
+    # Smallest flattened token row count using 1-core-per-row fused FP8 norm/SwiGLU TPC kernels.
+    # Defaults to 1 when CGUID dynamic quant is enabled (beats CGUID from B=1) and 16 otherwise
+    # (when native abs/amax fuses across all 24 TPC cores at small B<=8, while 1-core-per-row wins at B>=16).
+    "VLLM_HPU_GAUDI2_FP8_TPC_MIN_ROWS":
+    lambda: max(
+        1,
+        int(
+            os.environ.get("VLLM_HPU_GAUDI2_FP8_TPC_MIN_ROWS", "").strip()
+            or ("1" if _bool_env("VLLM_HPU_CGUID_DYNAMIC_QUANT", os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false"))
+                else "16")
+        ),
+    ),
+    # Largest flattened token row count using custom fused FP8 norm/SwiGLU TPC kernels (0 = unlimited).
+    # Prefill buckets (>=128 rows) stay on Synapse's N-sliced SRAM W13+SiluAndMul bundle.
+    "VLLM_HPU_GAUDI2_FP8_TPC_MAX_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_GAUDI2_FP8_TPC_MAX_ROWS", "").strip() or "64"),
+    # Per-kernel toggles for custom Gaudi2 FP8/GDN/ShortConv TPC ops (require VLLM_HPU_GAUDI2_FP8_TPC=1;
+    # VLLM_HPU_TPC_GDN_GATED_NORM_F8 additionally requires VLLM_HPU_TPC_GDN_PREP=1 so gdn_decode outputs FP32).
+    "VLLM_HPU_TPC_ADD_RMS_NORM_F8":
+    lambda: _bool_env("VLLM_HPU_TPC_ADD_RMS_NORM_F8", "true"),
+    "VLLM_HPU_TPC_SANDWICH_RMS_NORM_F8":
+    lambda: _bool_env("VLLM_HPU_TPC_SANDWICH_RMS_NORM_F8", "true"),
+    "VLLM_HPU_TPC_SILU_MUL_F8":
+    lambda: _bool_env("VLLM_HPU_TPC_SILU_MUL_F8", "true"),
+    "VLLM_HPU_TPC_GDN_PREP":
+    lambda: _bool_env("VLLM_HPU_TPC_GDN_PREP", "true"),
+    "VLLM_HPU_TPC_GDN_GATED_NORM_F8":
+    lambda: _bool_env("VLLM_HPU_TPC_GDN_GATED_NORM_F8", "true"),
+    "VLLM_HPU_TPC_LFM3_SHORT_CONV":
+    lambda: _bool_env("VLLM_HPU_TPC_LFM3_SHORT_CONV", "true"),
     # LFM3-VL / LFM3-Omni vision tower on packed bucket shapes (vllm_gaudi/models/lfm3_vl.py); false keeps the
     # upstream tower (one graph per combination of frame sizes). TODO: remove with the fallback in models/__init__.py.
     "VLLM_HPU_LFM3_PACKED_TOWER":

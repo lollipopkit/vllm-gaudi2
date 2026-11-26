@@ -172,6 +172,7 @@ class Inkling2HPUConvState(nn.Module, AttentionLayerBase):
         load_idx = self._select_indices(getattr(attn_metadata, "load_indices_tensor", None))
         store_idx = self._select_indices(getattr(attn_metadata, "store_indices_tensor", None))
 
+        idx_dtype = torch.int32 if state_buf.device.type == "hpu" else torch.long
         if attn_metadata.is_prompt:
             b = max(1, batch_size)
             pad_mask = getattr(attn_metadata, "padding_mask_flat", None)
@@ -181,22 +182,22 @@ class Inkling2HPUConvState(nn.Module, AttentionLayerBase):
             prev_streams = None
             has_init = getattr(attn_metadata, "has_initial_states_p", None)
             if load_idx is not None and has_init is not None:
-                safe_load = torch.remainder(load_idx.reshape(-1)[:b].long(), num_slots)
+                safe_load = torch.remainder(load_idx.reshape(-1)[:b].to(idx_dtype), num_slots)
                 loaded = state_buf.index_select(0, safe_load)
                 init_mask = has_init.reshape(-1)[:b].bool().view(b, 1, 1)
                 loaded = torch.where(init_mask, loaded, torch.zeros_like(loaded))
                 prev_streams = loaded.split(self.stream_sizes, dim=-1)
             safe_store = (
-                torch.remainder(store_idx.reshape(-1)[:b].long(), num_slots)
+                torch.remainder(store_idx.reshape(-1)[:b].to(idx_dtype), num_slots)
                 if store_idx is not None
                 else None
             )
             return prev_streams, safe_store, True, pad_mask, seq_lens
 
         assert load_idx is not None
-        safe_load = torch.remainder(load_idx.reshape(-1).long(), num_slots)
+        safe_load = torch.remainder(load_idx.reshape(-1).to(idx_dtype), num_slots)
         safe_store = (
-            torch.remainder(store_idx.reshape(-1).long(), num_slots)
+            torch.remainder(store_idx.reshape(-1).to(idx_dtype), num_slots)
             if store_idx is not None
             else safe_load
         )
@@ -220,6 +221,7 @@ class Inkling2HPUConvState(nn.Module, AttentionLayerBase):
             or state_buf.dtype != torch.bfloat16
             or state_buf.ndim != 3
             or state_buf.shape[1] != 3
+            or not state_buf.is_contiguous()
         ):
             return None
         if isinstance(attn_metadata, dict):
@@ -263,14 +265,14 @@ class Inkling2HPUConvState(nn.Module, AttentionLayerBase):
         store_idx = self._select_indices(getattr(attn_metadata, "store_indices_tensor", None))
         if load_idx is None:
             return None
-        index_dtype = torch.int32 if state_buf.device.type == "hpu" else torch.int64
-        safe_load_i64 = torch.remainder(load_idx.reshape(-1).long(), num_slots)
+        idx_dtype = torch.int32 if state_buf.device.type == "hpu" else torch.long
+        safe_load = torch.remainder(load_idx.reshape(-1).to(idx_dtype), num_slots)
         safe_store = (
-            torch.remainder(store_idx.reshape(-1).long(), num_slots).to(index_dtype)
+            torch.remainder(store_idx.reshape(-1).to(idx_dtype), num_slots)
             if store_idx is not None
-            else safe_load_i64.to(index_dtype)
+            else safe_load
         )
-        return state_buf, safe_load_i64.to(torch.int32).contiguous(), safe_store
+        return state_buf, safe_load.to(torch.int32).contiguous(), safe_store
 
     def store_streams(
         self,
@@ -282,6 +284,17 @@ class Inkling2HPUConvState(nn.Module, AttentionLayerBase):
             return
         state_buf = self._state_buffer()
         state_buf.index_copy_(0, index_copy_indices(safe_store), torch.cat(parts, dim=-1))
+
+    def store_packed_streams(
+        self,
+        safe_store: torch.Tensor | None,
+        full_state: torch.Tensor,
+    ) -> None:
+        """Write pre-packed `[B, 3, total_dim]` conv state without `torch.cat` DmaMemcpy."""
+        if safe_store is None:
+            return
+        state_buf = self._state_buffer()
+        state_buf.index_copy_(0, index_copy_indices(safe_store), full_state)
 
 
 def _causal_conv_prefill_batch(

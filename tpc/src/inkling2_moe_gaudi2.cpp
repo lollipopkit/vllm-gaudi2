@@ -26,6 +26,8 @@ extern unsigned char _binary___inkling2_moe_gate_gemv_splitk_b1_gaudi2_o_start;
 extern unsigned char _binary___inkling2_moe_gate_gemv_splitk_b1_gaudi2_o_end;
 extern unsigned char _binary___inkling2_moe_sum_sconv_res_decode_gaudi2_o_start;
 extern unsigned char _binary___inkling2_moe_sum_sconv_res_decode_gaudi2_o_end;
+extern unsigned char _binary___inkling2_moe_sum_sconv_pack_decode_gaudi2_o_start;
+extern unsigned char _binary___inkling2_moe_sum_sconv_pack_decode_gaudi2_o_end;
 
 using inkling2_glue::CopyElf;
 using inkling2_glue::Is;
@@ -582,12 +584,22 @@ tpc_lib_api::GlueCodeReturn Inkling2MoeSumSconvResDecodeGaudi2::GetKernelName(
 tpc_lib_api::GlueCodeReturn Inkling2MoeSumSconvResDecodeGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in_defs, tpc_lib_api::HabanaKernelInstantiation* out_defs)
 {
-    enum Input { MOE_PARTIAL = 0, CONV_STATE, LOAD_SLOTS, WEIGHT_T, PARTIAL_RES, ATTN_OUT, NUM_INPUTS };
+    enum Input
+    {
+        MOE_PARTIAL = 0,
+        CONV_STATE,
+        LOAD_SLOTS,
+        WEIGHT_T,
+        PARTIAL_RES,
+        ATTN_OUT,
+        NEW_KV_STATE,
+        NEW_ATTN_STATE
+    };
     enum Output { NEW_PARTIAL = 0, NEW_MLP_STATE, NUM_OUTPUTS };
 
-    if (in_defs->inputTensorNr != NUM_INPUTS)
+    if (in_defs->inputTensorNr != 6 && in_defs->inputTensorNr != 8)
     {
-        in_defs->inputTensorNr = NUM_INPUTS;
+        in_defs->inputTensorNr = 6;
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
     }
     if (in_defs->outputTensorNr != NUM_OUTPUTS)
@@ -598,6 +610,7 @@ tpc_lib_api::GlueCodeReturn Inkling2MoeSumSconvResDecodeGaudi2::GetGcDefinitions
     if (in_defs->nodeParams.nodeParams == nullptr || in_defs->nodeParams.nodeParamsSize < sizeof(Params))
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
 
+    const bool packFullState = (in_defs->inputTensorNr == 8);
     const auto* params = static_cast<const Params*>(in_defs->nodeParams.nodeParams);
     const uint64_t H = in_defs->inputTensors[MOE_PARTIAL].geometry.maxSizes[0];
     const uint64_t topK = in_defs->inputTensors[MOE_PARTIAL].geometry.maxSizes[1];
@@ -610,10 +623,21 @@ tpc_lib_api::GlueCodeReturn Inkling2MoeSumSconvResDecodeGaudi2::GetGcDefinitions
         !std::isfinite(params->outScale))
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
 
+    uint64_t kvWidth = 0;
+    if (packFullState)
+    {
+        kvWidth = in_defs->inputTensors[NEW_KV_STATE].geometry.maxSizes[0];
+        if (kvWidth == 0 || (kvWidth % 64) != 0 || kvWidth > 2 * H || totalDim != kvWidth + 2 * H ||
+            static_cast<uint64_t>(params->streamOffset) != kvWidth + H)
+            return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+
     const uint64_t mpSz[] = {H, topK, B};
     const uint64_t csSz[] = {totalDim, 3, numSlots};
     const uint64_t lsSz[] = {B};
-    const uint64_t stSz[] = {H, 3, B};
+    const uint64_t stSz[] = {packFullState ? totalDim : H, 3, B};
+    const uint64_t kvStSz[] = {kvWidth, 3, B};
+    const uint64_t attnStSz[] = {H, 3, B};
     const uint64_t wtSz[] = {H, 4};
     const uint64_t hbSz[] = {H, B};
 
@@ -623,6 +647,8 @@ tpc_lib_api::GlueCodeReturn Inkling2MoeSumSconvResDecodeGaudi2::GetGcDefinitions
         !Is(in_defs->inputTensors[WEIGHT_T], tpc_lib_api::DATA_BF16, 2, wtSz) ||
         !Is(in_defs->inputTensors[PARTIAL_RES], tpc_lib_api::DATA_BF16, 2, hbSz) ||
         !Is(in_defs->inputTensors[ATTN_OUT], tpc_lib_api::DATA_BF16, 2, hbSz) ||
+        (packFullState && (!Is(in_defs->inputTensors[NEW_KV_STATE], tpc_lib_api::DATA_BF16, 3, kvStSz) ||
+                           !Is(in_defs->inputTensors[NEW_ATTN_STATE], tpc_lib_api::DATA_BF16, 3, attnStSz))) ||
         !Is(in_defs->outputTensors[NEW_PARTIAL], tpc_lib_api::DATA_BF16, 2, hbSz) ||
         !Is(in_defs->outputTensors[NEW_MLP_STATE], tpc_lib_api::DATA_BF16, 3, stSz))
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
@@ -631,7 +657,7 @@ tpc_lib_api::GlueCodeReturn Inkling2MoeSumSconvResDecodeGaudi2::GetGcDefinitions
     out_defs->indexSpaceGeometry[0] = H / 64;
     out_defs->indexSpaceGeometry[1] = B;
 
-    for (int i = 0; i < NUM_INPUTS; i++)
+    for (unsigned i = 0; i < in_defs->inputTensorNr; i++)
         out_defs->inputTensorAccessPattern[i].allRequired = true;
 
     auto& apP = out_defs->outputTensorAccessPattern[NEW_PARTIAL];
@@ -639,7 +665,7 @@ tpc_lib_api::GlueCodeReturn Inkling2MoeSumSconvResDecodeGaudi2::GetGcDefinitions
     Map(apP.mapping[1], 1, 1, 0, 0);
 
     auto& apS = out_defs->outputTensorAccessPattern[NEW_MLP_STATE];
-    Map(apS.mapping[0], 0, 64, 0, 63);
+    Map(apS.mapping[0], 0, 64, 0, packFullState ? static_cast<float>(kvWidth + H + 63) : 63.0f);
     Map(apS.mapping[1], 0, 0, 0, 2);
     Map(apS.mapping[2], 1, 1, 0, 0);
 
@@ -648,6 +674,9 @@ tpc_lib_api::GlueCodeReturn Inkling2MoeSumSconvResDecodeGaudi2::GetGcDefinitions
     memcpy(&out_defs->kernel.scalarParams[1], &params->isFirst, sizeof(int));
     memcpy(&out_defs->kernel.scalarParams[2], &params->streamOffset, sizeof(int));
 
+    if (packFullState)
+        return CopyElf(out_defs, &_binary___inkling2_moe_sum_sconv_pack_decode_gaudi2_o_start,
+                       &_binary___inkling2_moe_sum_sconv_pack_decode_gaudi2_o_end);
     return CopyElf(out_defs, &_binary___inkling2_moe_sum_sconv_res_decode_gaudi2_o_start,
                    &_binary___inkling2_moe_sum_sconv_res_decode_gaudi2_o_end);
 }

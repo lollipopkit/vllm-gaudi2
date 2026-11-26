@@ -121,8 +121,10 @@ def compute_decode_attn_context_tensors(
     per-group ascending order (valid for non-contiguous PA).
     """
     device = positions.device
+    idx_dtype = torch.int32 if device.type == "hpu" else torch.long
+    positions_flat = positions.reshape(-1)
     if block_logical_idx is not None:
-        block_start_pos = block_logical_idx.long() * block_size
+        block_start_pos = block_logical_idx.to(idx_dtype) * block_size
     else:
         nb = block_groups.shape[0]
         same = block_groups.unsqueeze(1) == block_groups.unsqueeze(0)
@@ -130,30 +132,31 @@ def compute_decode_attn_context_tensors(
             torch.ones((nb, nb), dtype=torch.bool, device=device),
             diagonal=-1,
         )
-        block_start_pos = (same & strict_lower).sum(dim=1, dtype=torch.long) * block_size
+        block_start_pos = (same & strict_lower).sum(dim=1, dtype=idx_dtype) * block_size
 
-    index_copy_dtype = torch.int32 if device.type == "hpu" else torch.int64
     kv_slots = (
-        torch.remainder(slot_mapping.reshape(-1).long(), kv_num_slots).to(index_copy_dtype)
+        torch.remainder(slot_mapping.reshape(-1).to(idx_dtype), kv_num_slots)
         if slot_mapping is not None and kv_num_slots > 0
         else None
     )
-    conv_load_slots_i64 = (
-        torch.remainder(load_indices.long(), conv_num_slots)
+    conv_load_slots_raw = (
+        torch.remainder(load_indices.to(idx_dtype), conv_num_slots)
         if load_indices is not None and conv_num_slots > 0
         else None
     )
-    conv_load_slots = None if conv_load_slots_i64 is None else conv_load_slots_i64.to(torch.int32)
+    conv_load_slots = (
+        None if conv_load_slots_raw is None else conv_load_slots_raw.to(torch.int32)
+    )
     conv_store_slots = (
-        torch.remainder(store_indices.long(), conv_num_slots).to(index_copy_dtype)
+        torch.remainder(store_indices.to(idx_dtype), conv_num_slots)
         if store_indices is not None and conv_num_slots > 0
-        else (None if conv_load_slots_i64 is None else conv_load_slots_i64.to(index_copy_dtype))
+        else conv_load_slots_raw
     )
 
     bg_i32 = block_groups.to(torch.int32).contiguous()
     bu_i32 = block_usage.to(torch.int32).contiguous()
     bsp_i32 = block_start_pos.to(torch.int32).contiguous()
-    pos_i32 = positions.to(torch.int32).contiguous()
+    pos_i32 = positions_flat.to(torch.int32).contiguous()
     bl_i32 = None if block_list is None else block_list.to(torch.int32).contiguous()
 
     if tpc_only:
@@ -179,15 +182,15 @@ def compute_decode_attn_context_tensors(
         )
 
     valid_blk = block_groups >= 0  # [NB]
-    safe_grp = torch.remainder(block_groups.long(), batch_size)  # [NB]
-    slot_off = torch.arange(block_size, device=device, dtype=torch.long)
+    safe_grp = torch.remainder(block_groups.to(idx_dtype), batch_size)  # [NB]
+    slot_off = torch.arange(block_size, device=device, dtype=idx_dtype)
     k_pos = block_start_pos.unsqueeze(1) + slot_off.unsqueeze(0)  # [NB, BS]
-    q_pos = positions.index_select(0, safe_grp).long().unsqueeze(1)  # [NB, 1]
+    q_pos = positions_flat.index_select(0, safe_grp).to(idx_dtype).unsqueeze(1)  # [NB, 1]
     dist = q_pos - k_pos  # [NB, BS]
 
     valid_global = (
         valid_blk.unsqueeze(1)
-        & (slot_off.unsqueeze(0) < block_usage.long().unsqueeze(1))
+        & (slot_off.unsqueeze(0) < block_usage.to(idx_dtype).unsqueeze(1))
         & (dist >= 0)
     )
     valid_local = valid_global & (dist < sliding_window)
@@ -263,6 +266,7 @@ def _sdpa_with_rel_bias_and_lse(
     sliding_window: int | None,
     enforce_index_causal: bool = False,
     k_valid_mask: torch.Tensor | None = None,
+    query_self_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact relative-bias GQA for one sequence returning `(out [Lq, H, D], lse [Lq, H])`."""
     lq, h, d = q.shape
@@ -275,19 +279,31 @@ def _sdpa_with_rel_bias_and_lse(
     k_g = k.permute(1, 2, 0).unsqueeze(1)  # [H_kv, 1, D, Lk]
     scores = torch.matmul(q_g, k_g).float().reshape(h, lq, lk) * scale
 
-    dist = q_positions.unsqueeze(1) - k_positions.unsqueeze(0)  # [Lq, Lk]
+    use_i32_select = q.device.type == "hpu" and lq * extent < (1 << 30)
+    idx_dtype = torch.int32 if q.device.type == "hpu" else torch.long
+    qp = q_positions.reshape(-1).to(idx_dtype)
+    kp = k_positions.reshape(-1).to(idx_dtype)
+    dist = qp.unsqueeze(1) - kp.unsqueeze(0)  # [Lq, Lk]
     invalid = dist < 0
     if sliding_window is not None:
         invalid = invalid | (dist >= sliding_window)
-    if enforce_index_causal and lq == lk:
-        idx = torch.arange(lq, device=q.device, dtype=torch.long)
-        invalid = invalid | (idx.unsqueeze(0) > idx.unsqueeze(1))
+    if enforce_index_causal and lk == query_self_offset + lq:
+        q_idx = torch.arange(lq, device=q.device, dtype=idx_dtype).unsqueeze(1)
+        k_idx = torch.arange(lk, device=q.device, dtype=idx_dtype).unsqueeze(0) - query_self_offset
+        invalid = invalid | (k_idx > q_idx)
     if k_valid_mask is not None:
         invalid = invalid | (~k_valid_mask.unsqueeze(0))
 
     clamped = dist.clamp(0, extent - 1)
-    rel_h = rel_logits.transpose(0, 1).float()  # [H, Lq, E]
-    bias = rel_h.gather(-1, clamped.unsqueeze(0).expand(h, -1, -1))
+    if use_i32_select:
+        # 1D int32 index_select cuts index HBM by 48x vs 3D int64 gather ([Lq*Lk] i32 vs [H, Lq, Lk] i64).
+        rel_flat = rel_logits.transpose(1, 2).contiguous().view(lq * extent, h)
+        row_base = torch.arange(lq, device=q.device, dtype=torch.int32).unsqueeze(1) * extent
+        flat_idx = (row_base + clamped.to(torch.int32)).reshape(-1)
+        bias = rel_flat.index_select(0, flat_idx).view(lq, lk, h).permute(2, 0, 1).float()
+    else:
+        rel_h = rel_logits.transpose(0, 1).float()  # [H, Lq, E]
+        bias = rel_h.gather(-1, clamped.long().unsqueeze(0).expand(h, -1, -1))
     scores = scores + bias
 
     neg_large = torch.full((), -1e30, dtype=torch.float32, device=q.device)
@@ -321,9 +337,8 @@ def _write_kv_to_paged_cache(
         if precomputed_slots is not None and precomputed_num_slots == key_cache.shape[0]:
             slots = precomputed_slots
         else:
-            slots = torch.remainder(slot_mapping.reshape(-1).long(), key_cache.shape[0])
-            if key_cache.device.type == "hpu":
-                slots = slots.to(torch.int32)
+            idx_dtype = torch.int32 if key_cache.device.type == "hpu" else torch.long
+            slots = torch.remainder(slot_mapping.reshape(-1).to(idx_dtype), key_cache.shape[0])
         slots = index_copy_indices(slots)
         key_cache.index_copy_(0, slots, k.to(key_cache.dtype))
         value_cache.index_copy_(0, slots, v.to(value_cache.dtype))
@@ -905,14 +920,21 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
         tpc_gated = False
         deferred_kv_slot_mapping: torch.Tensor | None = None
         if not has_cache:
-            rel_logits = torch.matmul(r.float(), self.rel_logits_proj.float()).to(q.dtype)
+            rel_logits = (
+                torch.matmul(r, self.rel_logits_proj)
+                if r.device.type == "hpu" and r.dtype == self.rel_logits_proj.dtype
+                else torch.matmul(r.float(), self.rel_logits_proj.float()).to(q.dtype)
+            )
+            pos_idx = positions.reshape(-1).to(
+                torch.int32 if q.device.type == "hpu" else torch.long
+            )
             attn_out, lse = _sdpa_with_rel_bias_and_lse(
                 q,
                 k,
                 v,
                 rel_logits,
-                positions.long(),
-                positions.long(),
+                pos_idx,
+                pos_idx,
                 scale=self.scaling,
                 sliding_window=self.sliding_window,
                 enforce_index_causal=True,
@@ -929,7 +951,11 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
                         precomputed_slots=None if decode_ctx is None else decode_ctx.kv_slots,
                         precomputed_num_slots=0 if decode_ctx is None else decode_ctx.kv_num_slots,
                     )
-                rel_logits = torch.matmul(r.float(), self.rel_logits_proj.float()).to(q.dtype)
+                rel_logits = (
+                    torch.matmul(r, self.rel_logits_proj)
+                    if r.device.type == "hpu" and r.dtype == self.rel_logits_proj.dtype
+                    else torch.matmul(r.float(), self.rel_logits_proj.float()).to(q.dtype)
+                )
                 attn_out, lse = self._prefill_attention(
                     q, k, v, rel_logits, positions, kv_cache, attn_metadata, batch_size=batch_size
                 )
@@ -1080,6 +1106,12 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         block_list = getattr(attn_metadata, "block_list", None)
         pad_mask = getattr(attn_metadata, "padding_mask_flat", None)
+        # Keep index/position arithmetic in native int32 on HPU: HPUModelRunner passes
+        # `positions`, `context_lens_tensor`, and `block_list` as int32, and upcasting
+        # negative `-1` pad positions to int64 before `torch.cat([ctx_pos, q_pos])`
+        # triggers a silent `pass_CastInt64ToInt32` miscompilation in `hpu_backend`.
+        idx_dtype = torch.int32 if q.device.type == "hpu" else torch.long
+        positions_flat = positions.reshape(-1)
 
         # Fast zero-sync path for non-chunked prefill (block_list is None).
         if block_list is None:
@@ -1091,13 +1123,14 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
                     if pad_mask is not None and pad_mask.numel() == s
                     else None
                 )
+                pos_idx = positions_flat.to(idx_dtype)
                 return _sdpa_with_rel_bias_and_lse(
                     q,
                     k,
                     v,
                     rel_logits,
-                    positions.long(),
-                    positions.long(),
+                    pos_idx,
+                    pos_idx,
                     scale=self.scaling,
                     sliding_window=self.sliding_window,
                     enforce_index_causal=True,
@@ -1111,13 +1144,14 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
                     if pad_mask is not None and pad_mask.numel() == b * s
                     else None
                 )
+                pos_idx = positions_flat[st:en].to(idx_dtype)
                 o_r, lse_r = _sdpa_with_rel_bias_and_lse(
                     q[st:en],
                     k[st:en],
                     v[st:en],
                     rel_logits[st:en],
-                    positions[st:en].long(),
-                    positions[st:en].long(),
+                    pos_idx,
+                    pos_idx,
                     scale=self.scaling,
                     sliding_window=self.sliding_window,
                     enforce_index_causal=True,
@@ -1127,16 +1161,85 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
                 lses.append(lse_r)
             return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
 
-        # Chunked prefill / prefix blocks path (block_list is not None).
+        # Static-shape zero-sync path for single-sequence HPU chunked prefill / prefix blocks:
+        # avoids .tolist() D2H syncs, Dynamo graph breaks, and dynamic-slice shape mismatches
+        # under VLLM_FULL_WARMUP=1 (`skip_guard_eval_unsafe`).
         num_tokens = q.shape[0]
+        block_size = int(getattr(attn_metadata, "block_size", 128))
+        ctx_lens = getattr(attn_metadata, "context_lens_tensor", None)
+        key_cache, value_cache = kv_cache[0], kv_cache[1]
+        if (
+            batch_size == 1
+            and key_cache.ndim == 3
+            and ctx_lens is not None
+            and ctx_lens.numel() == 1
+            and block_list.ndim == 1
+            and block_list.numel() > 0
+        ):
+            nb = block_list.shape[0]
+            k_4d = key_cache.view(-1, block_size, self.num_kv_heads, self.head_dim)
+            v_4d = value_cache.view(-1, block_size, self.num_kv_heads, self.head_dim)
+            past = ctx_lens.reshape(-1)[0].to(idx_dtype)
+            if self.sliding_window is not None:
+                # Local sliding-window layers only ever attend to the trailing
+                # `ceil(sliding_window / block_size) + 1` context blocks (2 blocks = 256 tokens
+                # for sw=128, bs=128). Appending `w_blks` `-1` sentinels unconditionally avoids
+                # any Python branch on `nb < w_blks` so NB=1 shares the symbolic Dynamo graph.
+                w_blks = (self.sliding_window + block_size - 1) // block_size + 1
+                bl_idx = block_list.to(idx_dtype)
+                bl_padded = torch.cat(
+                    [bl_idx, bl_idx.new_full((w_blks,), -1)], dim=0
+                )
+                num_ctx_blks = (past + block_size - 1) // block_size
+                start_blk = (num_ctx_blks - w_blks).clamp(min=0, max=nb)
+                win_idx = start_blk + torch.arange(w_blks, device=q.device, dtype=idx_dtype)
+                sel_blks = bl_padded.index_select(0, win_idx)
+                ctx_pos = start_blk * block_size + torch.arange(
+                    w_blks * block_size, device=q.device, dtype=idx_dtype
+                )
+            else:
+                w_blks = nb
+                sel_blks = block_list.to(idx_dtype)
+                ctx_pos = torch.arange(nb * block_size, device=q.device, dtype=idx_dtype)
+            safe_blks = torch.remainder(sel_blks, k_4d.shape[0])
+            k_ctx = k_4d.index_select(0, safe_blks).reshape(
+                w_blks * block_size, self.num_kv_heads, self.head_dim
+            )
+            v_ctx = v_4d.index_select(0, safe_blks).reshape(
+                w_blks * block_size, self.num_kv_heads, self.head_dim
+            )
+            ctx_valid = (sel_blks >= 0).repeat_interleave(block_size) & (ctx_pos < past)
+            q_pos = positions_flat.to(idx_dtype)
+            q_valid = (
+                pad_mask.reshape(-1).bool()
+                if pad_mask is not None and pad_mask.numel() == num_tokens
+                else torch.ones(num_tokens, dtype=torch.bool, device=q.device)
+            )
+            k_all = torch.cat([k_ctx.to(k.dtype), k], dim=0)
+            v_all = torch.cat([v_ctx.to(v.dtype), v], dim=0)
+            k_pos = torch.cat([ctx_pos, q_pos], dim=0)
+            k_valid = torch.cat([ctx_valid, q_valid], dim=0)
+            return _sdpa_with_rel_bias_and_lse(
+                q,
+                k_all,
+                v_all,
+                rel_logits,
+                q_pos,
+                k_pos,
+                scale=self.scaling,
+                sliding_window=self.sliding_window,
+                enforce_index_causal=True,
+                k_valid_mask=k_valid,
+                query_self_offset=w_blks * block_size,
+            )
+
+        # Fallback path for CPU unit tests or multi-request batches.
         out = torch.zeros((num_tokens, self.num_heads, self.head_dim), dtype=torch.float32, device=q.device)
         lse = torch.zeros((num_tokens, self.num_heads), dtype=torch.float32, device=q.device)
-        block_size = int(getattr(attn_metadata, "block_size", 128))
         q_starts = getattr(attn_metadata, "query_start_loc_p", None)
         if q_starts is None:
             q_starts = getattr(attn_metadata, "query_start_loc", None)
         starts_cpu = q_starts.tolist() if q_starts is not None else [0, num_tokens]
-        ctx_lens = getattr(attn_metadata, "context_lens_tensor", None)
         ctx_list = ctx_lens.tolist() if ctx_lens is not None else [0] * (len(starts_cpu) - 1)
 
         blk_cursor = 0
@@ -1152,7 +1255,7 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
                 continue
             q_r = q[s:e]
             rel_r = rel_logits[s:e]
-            q_pos = positions[s:e].long()
+            q_pos = positions_flat[s:e].to(idx_dtype)
             past = ctx_list[r] if r < len(ctx_list) else 0
             q_valid = (
                 pad_mask.reshape(-1)[s:e].bool()
@@ -1169,7 +1272,7 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
                 k_r = torch.cat([k_ctx.to(k.dtype), k[s:e]], dim=0)
                 v_r = torch.cat([v_ctx.to(v.dtype), v[s:e]], dim=0)
                 k_pos = torch.cat(
-                    [torch.arange(past, device=q.device, dtype=torch.long), q_pos], dim=0
+                    [torch.arange(past, device=q.device, dtype=idx_dtype), q_pos], dim=0
                 )
                 k_valid = (
                     torch.cat(
@@ -1192,8 +1295,9 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
                 k_pos,
                 scale=self.scaling,
                 sliding_window=self.sliding_window,
-                enforce_index_causal=(past == 0),
+                enforce_index_causal=True,
                 k_valid_mask=k_valid,
+                query_self_offset=past if past > 0 else 0,
             )
             out[s:e] = o_r
             lse[s:e] = lse_r
@@ -1255,7 +1359,8 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
             v_4d = value_cache if value_cache.shape[2] == h_kv else value_cache.transpose(1, 2)
 
         num_phys_blocks = k_4d.shape[0]
-        safe_blks = torch.remainder(block_list.long(), num_phys_blocks)  # [NB]
+        idx_dtype = torch.int32 if q.device.type == "hpu" else torch.long
+        safe_blks = torch.remainder(block_list.to(idx_dtype), num_phys_blocks)  # [NB]
 
         k_blks = k_4d.index_select(0, safe_blks)  # [NB, BS, H_kv, D]
         v_blks = v_4d.index_select(0, safe_blks)  # [NB, BS, H_kv, D]

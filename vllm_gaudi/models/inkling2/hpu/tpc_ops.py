@@ -153,3 +153,11 @@ def has_tpc_blend_f8() -> bool:
 
 def has_tpc_moe_post() -> bool:
     return _env_enabled("INKLING2_TPC_MOE_POST") and ensure_tpc_ops_loaded()
+
+
+def has_tpc_moe_pack() -> bool:
+    return (
+        _env_enabled("INKLING2_TPC_MOE_PACK")
+        and has_tpc_moe_post()
+        and hasattr(torch.ops.custom_op, "inkling2_moe_sum_sconv_pack_decode")
+    )

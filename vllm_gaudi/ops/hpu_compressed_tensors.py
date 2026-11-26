@@ -42,7 +42,9 @@ from vllm.model_executor.kernels.linear.mixed_precision import (
     MPLinearKernel,
     MPLinearLayerConfig,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import (pack_quantized_values_into_int32,
+from vllm.model_executor.layers.fusion.quant_activation import as_quantized_activation
+from vllm.model_executor.layers.quantization.utils.quant_utils import (kFp8DynamicTokenSym,
+                                                                       pack_quantized_values_into_int32,
                                                                        unpack_quantized_values_into_int32, GroupShape)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import validate_fp8_block_shape
 
@@ -193,6 +195,13 @@ class HPUCompressedTensorsW8A8Fp8(CompressedTensorsScheme):
     def get_min_capability(cls) -> int:
         return -1
 
+    def _maybe_expose_dynamic_fp8_key(self, layer: torch.nn.Module) -> None:
+        if (hpu_ops.is_hpu_gaudi2 and getattr(layer, "weight", None) is not None
+                and layer.weight.dtype == torch.float8_e4m3fn and not self.is_static_input_scheme
+                and (self.weight_block_size is None or envs.VLLM_HPU_FORCE_CHANNEL_FP8)
+                and getattr(layer, "input_is_parallel", True)):
+            layer._input_quant_key = kFp8DynamicTokenSym
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
         # If channelwise, scales are already lined up
@@ -207,6 +216,7 @@ class HPUCompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             layer.quant_config.weight_block_size = self.weight_block_size
             layer = hpu_ops.fp8_block_linear_postprocess_weights(layer, envs.VLLM_HPU_FORCE_CHANNEL_FP8)
             input_scale = None
+            self._maybe_expose_dynamic_fp8_key(layer)
             return
         else:
             # required by torch.compile to be torch.nn.Parameter
@@ -228,6 +238,7 @@ class HPUCompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # postprocess weights for perchannel strategy
         if layer.scheme.strategy == QuantizationStrategy.CHANNEL:
             hpu_ops.fp8_perchannel_linear_postprocess_weights(layer)
+        self._maybe_expose_dynamic_fp8_key(layer)
 
     def create_weights(self, layer: torch.nn.Module, input_size_per_partition: int, output_partition_sizes: list[int],
                        input_size: int, output_size: int, params_dtype: torch.dtype, **extra_weight_attrs):
@@ -313,6 +324,16 @@ class HPUCompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             )
         weight_scale = layer.weight_scale_inv if hasattr(layer, "weight_scale_inv") else layer.weight_scale
         weight_scale = weight_scale.transpose(0, 1) if weight_scale.dim() > 1 else weight_scale
+        qa = as_quantized_activation(x, kFp8DynamicTokenSym)
+        if qa is not None:
+            output = hpu_ops.apply_prequant_fp8_linear_hpu(qa.data.view(-1, qa.data.shape[-1]),
+                                                           qa.scale.view(-1, 1),
+                                                           weight=layer.weight,
+                                                           weight_scale=weight_scale,
+                                                           bias=bias,
+                                                           trans_B=False,
+                                                           out_dtype=qa.orig_dtype)
+            return output.view(*qa.orig_shape[:-1], -1)
         input_scale = getattr(layer, 'input_scale', None)
         input_2d = x.view(-1, x.shape[-1])
         output = hpu_ops.apply_fp8_linear_hpu(input=input_2d,

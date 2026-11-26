@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import types
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 
@@ -53,6 +55,7 @@ from .sconv import (
 )
 from .tpc_ops import (
     ensure_tpc_ops_loaded,
+    has_tpc_moe_pack,
     has_tpc_moe_post,
     has_tpc_qkvr_prep,
     has_tpc_sconv,
@@ -193,6 +196,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
             for stream in (ATTN_STREAM, MLP_STREAM)
         )
         self.normalize_values = config.attn_res_normalize_values
+        self._use_moe_pack = os.environ.get("INKLING2_MOE_PACK_STATE", "0") == "1"
 
     def attention(
         self,
@@ -473,37 +477,59 @@ class Inkling2HPUDecoderLayer(nn.Module):
                 if getattr(self.mlp_sconv, "_weight_t_ready", False)
                 else self.mlp_sconv.conv_weight.t().contiguous()
             )
-            if direct_refs is not None:
-                assert conv_state_buf is not None and load_slots_i32 is not None
-                mlp_cs, mlp_ls, mlp_off = (
+            if (
+                direct_refs is not None
+                and self._use_moe_pack
+                and has_tpc_moe_pack()
+                and owner.kv_size <= owner.hidden_size
+            ):
+                assert conv_state_buf is not None and load_slots_i32 is not None and new_kv_state is not None
+                new_partial, new_full_state = torch.ops.custom_op.inkling2_moe_sum_sconv_pack_decode(
+                    moe_partial.contiguous(),
                     conv_state_buf,
                     load_slots_i32,
+                    w_t,
+                    partial.contiguous(),
+                    attn_out.contiguous(),
+                    new_kv_state.contiguous(),
+                    new_attn_state.contiguous(),
+                    float((self.mlp_sconv.kernel_size + 1) ** -0.5),
+                    1 if first else 0,
                     2 * owner.kv_size + owner.hidden_size,
                 )
+                owner.store_packed_streams(safe_store, new_full_state)
             else:
-                assert prev_mlp is not None
-                mlp_cs = prev_mlp.to(torch.bfloat16).contiguous()
-                mlp_ls = torch.arange(mlp_x_in.shape[0], device=mlp_x_in.device, dtype=torch.int32)
-                mlp_off = 0
-            new_partial, new_mlp_state = torch.ops.custom_op.inkling2_moe_sum_sconv_res_decode(
-                moe_partial.contiguous(),
-                mlp_cs,
-                mlp_ls,
-                w_t,
-                partial.contiguous(),
-                attn_out.contiguous(),
-                float((self.mlp_sconv.kernel_size + 1) ** -0.5),
-                1 if first else 0,
-                mlp_off,
-            )
-            if direct_refs is not None:
-                assert new_kv_state is not None
-                owner.store_streams(safe_store, (new_kv_state, new_attn_state, new_mlp_state))
-            else:
-                assert new_k_state is not None and new_v_state is not None
-                owner.store_streams(
-                    safe_store, (new_k_state, new_v_state, new_attn_state, new_mlp_state)
+                if direct_refs is not None:
+                    assert conv_state_buf is not None and load_slots_i32 is not None
+                    mlp_cs, mlp_ls, mlp_off = (
+                        conv_state_buf,
+                        load_slots_i32,
+                        2 * owner.kv_size + owner.hidden_size,
+                    )
+                else:
+                    assert prev_mlp is not None
+                    mlp_cs = prev_mlp.to(torch.bfloat16).contiguous()
+                    mlp_ls = torch.arange(mlp_x_in.shape[0], device=mlp_x_in.device, dtype=torch.int32)
+                    mlp_off = 0
+                new_partial, new_mlp_state = torch.ops.custom_op.inkling2_moe_sum_sconv_res_decode(
+                    moe_partial.contiguous(),
+                    mlp_cs,
+                    mlp_ls,
+                    w_t,
+                    partial.contiguous(),
+                    attn_out.contiguous(),
+                    float((self.mlp_sconv.kernel_size + 1) ** -0.5),
+                    1 if first else 0,
+                    mlp_off,
                 )
+                if direct_refs is not None:
+                    assert new_kv_state is not None
+                    owner.store_streams(safe_store, (new_kv_state, new_attn_state, new_mlp_state))
+                else:
+                    assert new_k_state is not None and new_v_state is not None
+                    owner.store_streams(
+                        safe_store, (new_k_state, new_v_state, new_attn_state, new_mlp_state)
+                    )
         else:
             if direct_refs is not None:
                 assert conv_state_buf is not None and load_slots_i32 is not None and new_kv_state is not None
@@ -596,6 +622,29 @@ class Inkling2HPUModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        # Split `forward` code objects by `(layer_cls, is_local)` (at most 4 variants instead of
+        # 24 per-layer code objects or 1 shared code object): keeps Python Dynamo compilation 6x
+        # faster than per-layer splitting while separating local vs full attention graphs cleanly.
+        variant_classes: dict[tuple[type, bool], type] = {}
+        for layer in self.layers:
+            base_cls = type(layer)
+            key = (base_cls, bool(layer.is_local))
+            cls = variant_classes.get(key)
+            if cls is None:
+                kind = "local" if layer.is_local else "full"
+                fwd = base_cls.forward
+                code = fwd.__code__.replace(co_name=f"{base_cls.__name__}_{kind}_forward")
+                new_fwd = types.FunctionType(
+                    code, fwd.__globals__, code.co_name, fwd.__defaults__, fwd.__closure__
+                )
+                if fwd.__kwdefaults__:
+                    new_fwd.__kwdefaults__ = dict(fwd.__kwdefaults__)
+                cls = type(f"{base_cls.__name__}_{kind}", (base_cls,), {"forward": new_fwd})
+                variant_classes[key] = cls
+            layer.__class__ = cls
+        self._hpu_max_code_visits = max(
+            Counter(type(layer) for layer in self.layers).values(), default=1
+        )
         self.attn_res = Inkling2HPUAttnRes(config)
         self.norm = Inkling2HPURMSNorm(config.hidden_size, config.rms_norm_eps)
 
@@ -637,7 +686,8 @@ class Inkling2HPUModel(nn.Module):
         attn_md = get_forward_context().attn_metadata
         if isinstance(attn_md, dict):
             attn_md = next(iter(attn_md.values()), None)
-        decode_bs = num_tokens if (attn_md is not None and not getattr(attn_md, "is_prompt", True)) else batch_size
+        is_decode = attn_md is not None and not getattr(attn_md, "is_prompt", True)
+        decode_bs = num_tokens if is_decode else batch_size
         decode_ctx = build_decode_attn_context(
             attn_md,
             positions,
@@ -653,8 +703,9 @@ class Inkling2HPUModel(nn.Module):
         for i, layer in enumerate(self.layers):
             first = i % self.block_size == 0
             completed = torch.stack(blocks, dim=0) if blocks else empty_blocks
-            need_f8 = i + 1 < num_layers
-            if not need_f8:
+            is_last = i + 1 >= num_layers
+            need_f8 = is_decode and not is_last
+            if is_last:
                 next_query = self.attn_res.output_query
                 next_norm = self.norm
             else:
@@ -672,7 +723,7 @@ class Inkling2HPUModel(nn.Module):
                 tau,
                 first=first,
                 pass_idx=0,
-                batch_size=batch_size,
+                batch_size=decode_bs,
                 decode_ctx=decode_ctx,
                 inputs_f8=inputs_f8,
                 inputs_sc=inputs_sc,

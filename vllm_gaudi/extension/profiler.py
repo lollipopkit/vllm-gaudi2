@@ -429,3 +429,6 @@ def make_habana_export_chrome_trace_accept_metadata() -> None:
 
     export_chrome_trace._vllm_gaudi_accepts_metadata = True
     cls.export_chrome_trace = export_chrome_trace
+
+
+make_habana_export_chrome_trace_accept_metadata()

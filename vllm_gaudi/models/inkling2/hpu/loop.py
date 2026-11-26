@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import types
+from collections import Counter
 from collections.abc import Callable
 
 import torch
@@ -210,12 +211,14 @@ class Inkling2HPULoopDecodeGroup(nn.Module):
         *,
         layers: tuple[Inkling2HPUDecoderLayer, ...],
         first_flags: tuple[bool, ...],
-        pass_idx: int,
+        pass_indices: tuple[int, ...],
+        save_prelude_flags: tuple[bool, ...],
+        loop_entry_flags: tuple[bool, ...],
         mlp_queries: tuple[torch.Tensor, ...],
         next_queries: tuple[torch.Tensor, ...],
         next_norm_weights: tuple[torch.Tensor | None, ...],
         next_norm_eps: tuple[float, ...],
-        message_queries: tuple[torch.Tensor, ...] | None,
+        message_queries: tuple[torch.Tensor | None, ...] | None,
         prelude_entry_query: torch.Tensor | None = None,
         prelude_num_blocks: int = 0,
         need_next_f8: tuple[bool, ...] | None = None,
@@ -223,7 +226,9 @@ class Inkling2HPULoopDecodeGroup(nn.Module):
         super().__init__()
         object.__setattr__(self, "_layers", layers)
         object.__setattr__(self, "_first_flags", first_flags)
-        object.__setattr__(self, "_pass_idx", pass_idx)
+        object.__setattr__(self, "_pass_indices", pass_indices)
+        object.__setattr__(self, "_save_prelude_flags", save_prelude_flags)
+        object.__setattr__(self, "_loop_entry_flags", loop_entry_flags)
         object.__setattr__(self, "_mlp_queries", mlp_queries)
         object.__setattr__(self, "_next_queries", next_queries)
         object.__setattr__(self, "_next_norm_weights", next_norm_weights)
@@ -245,6 +250,7 @@ class Inkling2HPULoopDecodeGroup(nn.Module):
         batch_size: int = 1,
         prelude_completed: torch.Tensor | None = None,
         prelude_partial: torch.Tensor | None = None,
+        prelude_dests: torch.Tensor | None = None,
         inputs_f8: torch.Tensor | None = None,
         inputs_sc: torch.Tensor | None = None,
     ) -> tuple[
@@ -254,44 +260,61 @@ class Inkling2HPULoopDecodeGroup(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
-        # Fold pass-boundary bank + prelude_dests into the compiled group (zero eager ops).
-        if self._prelude_entry_query is not None:
-            assert completed_blocks is not None
-            assert prelude_completed is not None and prelude_partial is not None
-            bank = torch.cat(
-                [completed_blocks[self._prelude_num_blocks + 1 :], partial.unsqueeze(0)],
-                dim=0,
-            )
-            cur_completed = prelude_completed
-            cur_partial = prelude_partial
-            cur_inputs = attn_res(
-                cur_completed,
-                cur_partial,
-                None,
-                self._prelude_entry_query,
-                None,
-                0.0,
-                True,
-            )
-            cur_inputs_f8: torch.Tensor | None = None
-            cur_inputs_sc: torch.Tensor | None = None
-        else:
-            cur_completed = (
-                partial.new_empty((0, partial.shape[0], partial.shape[1]))
-                if completed_blocks is None
-                else completed_blocks
-            )
-            cur_partial = partial
-            cur_inputs = inputs
-            cur_inputs_f8 = inputs_f8
-            cur_inputs_sc = inputs_sc
+        cur_completed = (
+            partial.new_empty((0, partial.shape[0], partial.shape[1]))
+            if completed_blocks is None
+            else completed_blocks
+        )
+        cur_partial = partial
+        cur_inputs = inputs
+        cur_inputs_f8 = inputs_f8
+        cur_inputs_sc = inputs_sc
+        cur_bank = bank
+        cur_prelude_completed = prelude_completed
+        cur_prelude_partial = prelude_partial
+        cur_prelude_dests = prelude_dests
 
-        pass_idx = self._pass_idx
+        pass_indices = self._pass_indices
+        save_prelude_flags = self._save_prelude_flags
+        loop_entry_flags = self._loop_entry_flags
         msg_queries = self._message_queries
         need_f8_flags = self._need_next_f8
         for idx, layer in enumerate(self._layers):
+            pass_idx = pass_indices[idx]
+            looped = pass_idx > 0
+            if save_prelude_flags[idx]:
+                cur_prelude_completed = cur_completed
+                cur_prelude_partial = cur_partial
+            elif loop_entry_flags[idx]:
+                assert cur_prelude_completed is not None and cur_prelude_partial is not None
+                assert self._prelude_entry_query is not None
+                cur_bank = torch.cat(
+                    [cur_completed[self._prelude_num_blocks + 1 :], cur_partial.unsqueeze(0)],
+                    dim=0,
+                )
+                cur_completed = cur_prelude_completed
+                cur_partial = cur_prelude_partial
+                if cur_prelude_dests is None:
+                    cur_prelude_dests = attn_res(
+                        cur_completed,
+                        cur_partial,
+                        None,
+                        self._prelude_entry_query,
+                        None,
+                        0.0,
+                        True,
+                    )
+                cur_inputs = cur_prelude_dests
+                cur_inputs_f8 = None
+                cur_inputs_sc = None
+
             first = self._first_flags[idx]
+            msg_q = None if msg_queries is None else msg_queries[idx]
+            step_bank = cur_bank if looped else None
             if need_f8_flags is not None:
                 need_f8 = need_f8_flags[idx]
                 res = layer(
@@ -308,8 +331,8 @@ class Inkling2HPULoopDecodeGroup(nn.Module):
                     pass_idx=pass_idx,
                     batch_size=batch_size,
                     decode_ctx=decode_ctx,
-                    bank=bank,
-                    message_query=None if msg_queries is None else msg_queries[idx],
+                    bank=step_bank,
+                    message_query=msg_q,
                     inputs_f8=cur_inputs_f8,
                     inputs_sc=cur_inputs_sc,
                     return_next_f8=need_f8,
@@ -334,8 +357,8 @@ class Inkling2HPULoopDecodeGroup(nn.Module):
                     pass_idx=pass_idx,
                     batch_size=batch_size,
                     decode_ctx=decode_ctx,
-                    bank=bank,
-                    message_query=None if msg_queries is None else msg_queries[idx],
+                    bank=step_bank,
+                    message_query=msg_q,
                 )
                 cur_inputs_f8 = cur_inputs_sc = None
             if first:
@@ -346,7 +369,17 @@ class Inkling2HPULoopDecodeGroup(nn.Module):
                 )
             cur_partial = new_partial
         assert cur_inputs is not None
-        return cur_completed, cur_partial, cur_inputs, bank, cur_inputs_f8, cur_inputs_sc
+        return (
+            cur_completed,
+            cur_partial,
+            cur_inputs,
+            cur_bank,
+            cur_prelude_completed,
+            cur_prelude_partial,
+            cur_prelude_dests,
+            cur_inputs_f8,
+            cur_inputs_sc,
+        )
 
 
 class Inkling2HPULoopModel(Inkling2HPUModel):
@@ -382,6 +415,9 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
             + [(i, p) for p in range(config.num_loop_passes) for i in self.loop_core]
             + [(i, 0) for i in range(self.loop_core.stop, len(self.layers))]
         )
+        self._hpu_max_code_visits = max(
+            Counter(type(self.layers[i]) for i, _ in self._visits).values(), default=1
+        )
 
     def compile_hpu_decode_groups(
         self, compile_fn: Callable[[nn.Module], nn.Module]
@@ -395,6 +431,8 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
             return len(self._hpu_decode_groups)
         g = int(os.environ.get("INKLING2_COMPILE_GROUP_SIZE", "6"))
         core = self.loop_core
+        visits = self._visits
+        total_visits = len(visits)
         if g <= 1:
             return 0
         if get_tensor_model_parallel_world_size() != 1:
@@ -403,27 +441,21 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
                 g,
             )
             return 0
-        if core.start % g != 0 or core.stop % g != 0 or len(self.layers) % g != 0:
-            logger.warning(
-                "INKLING2_COMPILE_GROUP_SIZE=%d does not divide core=(%d,%d) and num_layers=%d; "
-                "using per-layer compilation.",
-                g,
-                core.start,
-                core.stop,
-                len(self.layers),
-            )
-            return 0
 
-        visits = self._visits
-        total_visits = len(visits)
-        groups: list[tuple[int, int, nn.Module]] = []
+        prelude_blocks = sum(1 for j in range(core.start) if (j % self.block_size) == 0)
+        groups: list[nn.Module] = []
         for g_idx, v_start in enumerate(range(0, total_visits, g)):
-            first_i, pass_idx = visits[v_start]
-            looped = pass_idx > 0
             slice_visits = visits[v_start : v_start + g]
-            assert all(p == pass_idx for _, p in slice_visits)
             grp_layers = tuple(self.layers[i] for i, _ in slice_visits)
+            pass_indices = tuple(p for _, p in slice_visits)
             first_flags = tuple((i % self.block_size) == 0 for i, _ in slice_visits)
+            save_prelude_flags = tuple(
+                (i == core.start and p == 0) for i, p in slice_visits
+            )
+            loop_entry_flags = tuple(
+                (i == core.start and p > 0) for i, p in slice_visits
+            )
+            has_loop_entry = any(loop_entry_flags)
             mlp_qs = tuple(self.attn_res.mlp_queries[i] for i, _ in slice_visits)
             next_qs: list[torch.Tensor] = []
             next_nws: list[torch.Tensor | None] = []
@@ -445,12 +477,13 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
                         next_nws.append(nnorm.weight)
                         next_eps.append(nnorm.eps)
             msg_qs = (
-                tuple(self.message_queries[i - core.start] for i, _ in slice_visits)
-                if looped
+                tuple(
+                    self.message_queries[i - core.start] if p > 0 else None
+                    for i, p in slice_visits
+                )
+                if any(p > 0 for p in pass_indices)
                 else None
             )
-            is_loop_entry = first_i == core.start and looped
-            prelude_blocks = (core.start + self.block_size - 1) // self.block_size
             need_next_f8 = tuple(
                 nw is not None and (v_start + offset + 1 < total_visits)
                 for offset, nw in enumerate(next_nws)
@@ -458,33 +491,38 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
             grp = Inkling2HPULoopDecodeGroup(
                 layers=grp_layers,
                 first_flags=first_flags,
-                pass_idx=pass_idx,
+                pass_indices=pass_indices,
+                save_prelude_flags=save_prelude_flags,
+                loop_entry_flags=loop_entry_flags,
                 mlp_queries=mlp_qs,
                 next_queries=tuple(next_qs),
                 next_norm_weights=tuple(next_nws),
                 next_norm_eps=tuple(next_eps),
                 message_queries=msg_qs,
                 prelude_entry_query=(
-                    self.attn_res.attn_queries[core.start - 1] if is_loop_entry else None
+                    self.attn_res.attn_queries[core.start - 1]
+                    if (has_loop_entry and core.start > 0)
+                    else None
                 ),
-                prelude_num_blocks=prelude_blocks if is_loop_entry else 0,
+                prelude_num_blocks=prelude_blocks if has_loop_entry else 0,
                 need_next_f8=need_next_f8,
             )
             # Distinct forward code object per visit group: Dynamo keys its cache
             # on the code object, preventing cache collisions under skip_guard_eval_unsafe.
             fwd = Inkling2HPULoopDecodeGroup.forward
             code = fwd.__code__.replace(co_name=f"inkling2_decode_g{g_idx}")
+            new_fwd = types.FunctionType(
+                code, fwd.__globals__, code.co_name, fwd.__defaults__, fwd.__closure__
+            )
+            if fwd.__kwdefaults__:
+                new_fwd.__kwdefaults__ = dict(fwd.__kwdefaults__)
             cls = type(
                 f"Inkling2HPULoopDecodeGroupV{g_idx}",
                 (Inkling2HPULoopDecodeGroup,),
-                {
-                    "forward": types.FunctionType(
-                        code, fwd.__globals__, code.co_name, fwd.__defaults__, fwd.__closure__
-                    )
-                },
+                {"forward": new_fwd},
             )
             grp.__class__ = cls
-            groups.append((first_i, pass_idx, compile_fn(grp)))
+            groups.append(compile_fn(grp))
 
         prologue = Inkling2HPUDecodePrologue(
             n_floor=self.config.log_scaling_n_floor,
@@ -632,7 +670,7 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
                 next_i, next_pass = visits[visit + 1]
                 next_query = self.attn_res.attn_queries[next_i - 1]
                 next_norm = None if next_pass else self.layers[next_i].attn_norm
-                need_f8 = next_norm is not None
+                need_f8 = is_decode and (next_norm is not None)
 
             first = i % self.block_size == 0
             layer = self.layers[i]
@@ -648,7 +686,7 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
                 tau,
                 first=first,
                 pass_idx=pass_idx,
-                batch_size=batch_size,
+                batch_size=eff_bs,
                 decode_ctx=decode_ctx,
                 bank=bank if looped else None,
                 message_query=self.message_queries[i - core.start] if looped else None,
@@ -707,9 +745,8 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
         tau: torch.Tensor | None,
         batch_size: int,
         decode_ctx: DecodeAttnContext,
-        decode_groups: tuple[tuple[int, int, nn.Module], ...],
+        decode_groups: tuple[nn.Module, ...],
     ) -> torch.Tensor:
-        core = self.loop_core
         completed: torch.Tensor | None = None
         partial = inputs_embeds
         inputs: torch.Tensor | None = None
@@ -718,26 +755,33 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
         bank: torch.Tensor | None = None
         prelude_completed: torch.Tensor | None = None
         prelude_partial: torch.Tensor | None = None
+        prelude_dests: torch.Tensor | None = None
 
-        for first_i, pass_idx, group in decode_groups:
-            looped = pass_idx > 0
-            if first_i == core.start and not looped:
-                prelude_completed = completed
-                prelude_partial = partial
-            is_loop_entry = first_i == core.start and looped
-            completed, partial, inputs, bank, inputs_f8, inputs_sc = group(
+        for group in decode_groups:
+            (
+                completed,
+                partial,
+                inputs,
+                bank,
+                prelude_completed,
+                prelude_partial,
+                prelude_dests,
+                inputs_f8,
+                inputs_sc,
+            ) = group(
                 positions,
                 completed,
                 partial,
                 inputs,
                 tau,
                 decode_ctx,
-                bank if (looped and not is_loop_entry) else None,
+                bank,
                 batch_size,
-                prelude_completed if is_loop_entry else None,
-                prelude_partial if is_loop_entry else None,
-                None if is_loop_entry else inputs_f8,
-                None if is_loop_entry else inputs_sc,
+                prelude_completed,
+                prelude_partial,
+                prelude_dests,
+                inputs_f8,
+                inputs_sc,
             )
 
         assert inputs is not None

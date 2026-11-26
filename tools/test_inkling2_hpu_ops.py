@@ -726,62 +726,83 @@ def test_loop_decode_group_matches_ungrouped_with_nondivisible_core_start() -> N
         partial = new_p
     ref_out = cur_in[0]
 
-    # Run grouped via Inkling2HPULoopDecodeGroup (g=2)
-    g = 2
-    groups = []
-    for v_start in range(0, len(visits), g):
-        sl = visits[v_start : v_start + g]
-        fi, pi = sl[0]
-        looped = pi > 0
-        nqs, nws, nes = [], [], []
-        for off, (i, _) in enumerate(sl):
-            vi = v_start + off
-            if vi + 1 == len(visits):
-                nqs.append(out_q)
-                nws.append(norm_w)
-                nes.append(1e-6)
-            else:
-                ni, np_ = visits[vi + 1]
-                nqs.append(attn_qs[ni - 1])
-                nws.append(None if np_ else norm_w)
-                nes.append(0.0 if np_ else 1e-6)
-        is_entry = fi == core.start and looped
-        grp = loop_mod.Inkling2HPULoopDecodeGroup(
-            layers=tuple(layers[i] for i, _ in sl),
-            first_flags=tuple((i % block_size) == 0 for i, _ in sl),
-            pass_idx=pi,
-            mlp_queries=tuple(mlp_qs[i] for i, _ in sl),
-            next_queries=tuple(nqs),
-            next_norm_weights=tuple(nws),
-            next_norm_eps=tuple(nes),
-            message_queries=tuple(msg_qs[i - core.start] for i, _ in sl) if looped else None,
-            prelude_entry_query=attn_qs[core.start - 1] if is_entry else None,
-            prelude_num_blocks=prelude_num_blocks if is_entry else 0,
-        )
-        groups.append((fi, pi, grp))
+    # Run grouped via Inkling2HPULoopDecodeGroup across both g=2 (same-pass) and g=5 (multi-pass boundary crossing)
+    for g in (2, 5, len(visits)):
+        groups = []
+        for v_start in range(0, len(visits), g):
+            sl = visits[v_start : v_start + g]
+            p_indices = tuple(p for _, p in sl)
+            save_flags = tuple((i == core.start and p == 0) for i, p in sl)
+            entry_flags = tuple((i == core.start and p > 0) for i, p in sl)
+            nqs, nws, nes = [], [], []
+            for off, (i, _) in enumerate(sl):
+                vi = v_start + off
+                if vi + 1 == len(visits):
+                    nqs.append(out_q)
+                    nws.append(norm_w)
+                    nes.append(1e-6)
+                else:
+                    ni, np_ = visits[vi + 1]
+                    nqs.append(attn_qs[ni - 1])
+                    nws.append(None if np_ else norm_w)
+                    nes.append(0.0 if np_ else 1e-6)
+            has_entry = any(entry_flags)
+            grp = loop_mod.Inkling2HPULoopDecodeGroup(
+                layers=tuple(layers[i] for i, _ in sl),
+                first_flags=tuple((i % block_size) == 0 for i, _ in sl),
+                pass_indices=p_indices,
+                save_prelude_flags=save_flags,
+                loop_entry_flags=entry_flags,
+                mlp_queries=tuple(mlp_qs[i] for i, _ in sl),
+                next_queries=tuple(nqs),
+                next_norm_weights=tuple(nws),
+                next_norm_eps=tuple(nes),
+                message_queries=(
+                    tuple(msg_qs[i - core.start] if p > 0 else None for i, p in sl)
+                    if any(p > 0 for p in p_indices)
+                    else None
+                ),
+                prelude_entry_query=attn_qs[core.start - 1] if has_entry else None,
+                prelude_num_blocks=prelude_num_blocks if has_entry else 0,
+            )
+            groups.append(grp)
 
-    g_completed = None
-    g_partial = x0
-    g_in = x0.unsqueeze(0).expand(3, -1, -1).contiguous()
-    g_bank = None
-    g_pre_c = None
-    g_pre_p = None
-    for fi, pi, grp in groups:
-        if fi == core.start and pi == 0:
-            g_pre_c, g_pre_p = g_completed, g_partial
-        g_completed, g_partial, g_in, g_bank, _, _ = grp(
-            None,
-            g_completed,
-            g_partial,
-            g_in,
-            None,
-            None,
-            g_bank if pi > 0 else None,
-            1,
-            g_pre_c if (fi == core.start and pi > 0) else None,
-            g_pre_p if (fi == core.start and pi > 0) else None,
-        )
-    assert torch.allclose(g_in[0].float(), ref_out.float(), atol=1e-5)
+        g_completed = None
+        g_partial = x0
+        g_in = x0.unsqueeze(0).expand(3, -1, -1).contiguous()
+        g_bank = None
+        g_pre_c = None
+        g_pre_p = None
+        g_pre_d = None
+        g_f8 = None
+        g_sc = None
+        for grp in groups:
+            (
+                g_completed,
+                g_partial,
+                g_in,
+                g_bank,
+                g_pre_c,
+                g_pre_p,
+                g_pre_d,
+                g_f8,
+                g_sc,
+            ) = grp(
+                None,
+                g_completed,
+                g_partial,
+                g_in,
+                None,
+                None,
+                g_bank,
+                1,
+                g_pre_c,
+                g_pre_p,
+                g_pre_d,
+                g_f8,
+                g_sc,
+            )
+        assert torch.allclose(g_in[0].float(), ref_out.float(), atol=1e-5)
 
 
 def test_compute_decode_attn_context_tpc_only_and_slots() -> None:
@@ -943,7 +964,9 @@ def test_loop_decode_group_need_next_f8() -> None:
     grp = loop_mod.Inkling2HPULoopDecodeGroup(
         layers=layers,
         first_flags=(False, False),
-        pass_idx=0,
+        pass_indices=(0, 0),
+        save_prelude_flags=(False, False),
+        loop_entry_flags=(False, False),
         mlp_queries=(q, q),
         next_queries=(q, q),
         next_norm_weights=(nw, nw),
@@ -953,7 +976,113 @@ def test_loop_decode_group_need_next_f8() -> None:
     )
     x0 = torch.randn(t, d, dtype=torch.bfloat16)
     inp = x0.unsqueeze(0).expand(3, -1, -1).contiguous()
-    _, _, out_bf16, _, out_f8, out_sc = grp(None, None, x0, inp, None, None, None, t)
+    _, _, out_bf16, _, _, _, _, out_f8, out_sc = grp(None, None, x0, inp, None, None, None, t)
     assert seen_f8 == [(False, True), (True, True)]
     assert out_f8 is not None and out_f8.dtype == torch.float8_e4m3fn and out_f8.shape == out_bf16.shape
     assert out_sc is not None and out_sc.dtype == torch.float32 and out_sc.shape == (3, t)
+
+
+def test_prefill_attention_static_chunked_and_sliding_window_slice() -> None:
+    attn_mod = sys.modules["inkling2_pkg.hpu.attention"]
+    torch.manual_seed(17)
+    h, h_kv, d, bs = 4, 2, 8, 8
+    num_phys = 10
+    k_3d = torch.randn(num_phys * bs, h_kv, d, dtype=torch.bfloat16)
+    v_3d = torch.randn(num_phys * bs, h_kv, d, dtype=torch.bfloat16)
+    k_4d = k_3d.view(num_phys, bs, h_kv, d)
+    v_4d = v_3d.view(num_phys, bs, h_kv, d)
+
+    # Unaligned context `past = 21` across 3 real blocks [4, 1, 7] + 3 `-1` padded bucket blocks,
+    # plus `q_real = 5` padded to bucket `lq = 8` with `-1` trailing positions.
+    past, q_real, lq = 21, 5, 8
+    block_list = torch.tensor([4, 1, 7, -1, -1, -1], dtype=torch.int32)
+    q = torch.randn(lq, h, d, dtype=torch.bfloat16)
+    k = torch.randn(lq, h_kv, d, dtype=torch.bfloat16)
+    v = torch.randn(lq, h_kv, d, dtype=torch.bfloat16)
+    pad_mask = torch.tensor([1.0] * q_real + [0.0] * (lq - q_real), dtype=torch.bfloat16).view(lq, 1)
+    for past, sw, extent in ((21, None, 64), (21, 8, 8), (9, 4, 8), (17, 12, 16)):
+        pos = torch.tensor([past + i for i in range(q_real)] + [-1] * (lq - q_real), dtype=torch.int32)
+        rel = torch.randn(lq, h, extent, dtype=torch.bfloat16)
+        dummy = types.SimpleNamespace(
+            num_heads=h,
+            num_kv_heads=h_kv,
+            head_dim=d,
+            scaling=d**-0.5,
+            sliding_window=sw,
+        )
+        md_static = types.SimpleNamespace(
+            block_size=bs,
+            block_list=block_list,
+            context_lens_tensor=torch.tensor([past], dtype=torch.int32),
+            padding_mask_flat=pad_mask,
+        )
+        out_s, lse_s = attn_mod.Inkling2HPUAttention._prefill_attention(
+            dummy, q, k, v, rel, pos, (k_3d, v_3d), md_static, batch_size=1
+        )
+        md_ref = types.SimpleNamespace(
+            block_size=bs,
+            block_list=block_list,
+            context_lens_tensor=torch.tensor([past], dtype=torch.int32),
+            query_start_loc_p=torch.tensor([0, q_real], dtype=torch.int32),
+            padding_mask_flat=pad_mask,
+        )
+        out_r, lse_r = attn_mod.Inkling2HPUAttention._prefill_attention(
+            dummy, q, k, v, rel, pos, (k_4d, v_4d), md_ref, batch_size=1
+        )
+        assert torch.allclose(out_s[:q_real], out_r[:q_real], atol=1e-4)
+        assert torch.allclose(lse_s[:q_real], lse_r[:q_real], atol=1e-4)
+
+    # Single context block (`nb=1 < target_w_blks=2`) pads to constant `w_blks=2` without changing outputs.
+    bl_single = torch.tensor([4], dtype=torch.int32)
+    pos_1 = torch.tensor([5 + i for i in range(q_real)] + [-1] * (lq - q_real), dtype=torch.int32)
+    rel_1 = torch.randn(lq, h, 8, dtype=torch.bfloat16)
+    dummy_1 = types.SimpleNamespace(num_heads=h, num_kv_heads=h_kv, head_dim=d, scaling=d**-0.5, sliding_window=8)
+    md_s1 = types.SimpleNamespace(
+        block_size=bs, block_list=bl_single, context_lens_tensor=torch.tensor([5], dtype=torch.int32), padding_mask_flat=pad_mask
+    )
+    md_r1 = types.SimpleNamespace(
+        block_size=bs, block_list=bl_single, context_lens_tensor=torch.tensor([5], dtype=torch.int32),
+        query_start_loc_p=torch.tensor([0, q_real], dtype=torch.int32), padding_mask_flat=pad_mask
+    )
+    out_s1, lse_s1 = attn_mod.Inkling2HPUAttention._prefill_attention(dummy_1, q, k, v, rel_1, pos_1, (k_3d, v_3d), md_s1, batch_size=1)
+    out_r1, lse_r1 = attn_mod.Inkling2HPUAttention._prefill_attention(dummy_1, q, k, v, rel_1, pos_1, (k_4d, v_4d), md_r1, batch_size=1)
+    assert torch.allclose(out_s1[:q_real], out_r1[:q_real], atol=1e-4)
+    assert torch.allclose(lse_s1[:q_real], lse_r1[:q_real], atol=1e-4)
+
+    # 2D `[1, lq]` int32 positions (as passed by HPUModelRunner) work on both non-chunked and chunked paths.
+    pos_2d_c1 = torch.arange(lq, dtype=torch.int32).view(1, lq)
+    md_c1 = types.SimpleNamespace(block_size=bs, block_list=None, padding_mask_flat=pad_mask)
+    out_c1_2d, _ = attn_mod.Inkling2HPUAttention._prefill_attention(dummy_1, q, k, v, rel_1, pos_2d_c1, (k_3d, v_3d), md_c1, batch_size=1)
+    out_c1_1d, _ = attn_mod.Inkling2HPUAttention._prefill_attention(dummy_1, q, k, v, rel_1, pos_2d_c1.view(-1), (k_3d, v_3d), md_c1, batch_size=1)
+    assert torch.allclose(out_c1_2d[:q_real], out_c1_1d[:q_real], atol=1e-4)
+
+    pos_2d_c2 = pos_1.view(1, lq)
+    out_c2_2d, _ = attn_mod.Inkling2HPUAttention._prefill_attention(dummy_1, q, k, v, rel_1, pos_2d_c2, (k_3d, v_3d), md_s1, batch_size=1)
+    assert torch.allclose(out_c2_2d[:q_real], out_r1[:q_real], atol=1e-4)
+    out_r1_2d, _ = attn_mod.Inkling2HPUAttention._prefill_attention(dummy_1, q, k, v, rel_1, pos_2d_c2, (k_4d, v_4d), md_r1, batch_size=1)
+    assert torch.allclose(out_r1_2d[:q_real], out_r1[:q_real], atol=1e-4)
+
+    # 2D `[b, s]` positions on multi-request non-chunked prefill, direct SDPA, and decode context.
+    q_b2 = torch.randn(2 * lq, h, d, dtype=torch.bfloat16)
+    k_b2 = torch.randn(2 * lq, h_kv, d, dtype=torch.bfloat16)
+    v_b2 = torch.randn(2 * lq, h_kv, d, dtype=torch.bfloat16)
+    rel_b2 = torch.randn(2 * lq, h, 8, dtype=torch.bfloat16)
+    pos_b2 = torch.stack([torch.arange(lq, dtype=torch.int32), torch.arange(lq, dtype=torch.int32)])
+    md_b2 = types.SimpleNamespace(block_size=bs, block_list=None, padding_mask_flat=None)
+    out_b2_2d, _ = attn_mod.Inkling2HPUAttention._prefill_attention(dummy_1, q_b2, k_b2, v_b2, rel_b2, pos_b2, (k_3d, v_3d), md_b2, batch_size=2)
+    out_b2_1d, _ = attn_mod.Inkling2HPUAttention._prefill_attention(dummy_1, q_b2, k_b2, v_b2, rel_b2, pos_b2.reshape(-1), (k_3d, v_3d), md_b2, batch_size=2)
+    assert torch.allclose(out_b2_2d, out_b2_1d, atol=1e-4)
+    out_sdpa_2d, _ = attn_mod._sdpa_with_rel_bias_and_lse(q, k, v, rel_1, pos_2d_c1, pos_2d_c1, scale=d**-0.5, sliding_window=8, enforce_index_causal=True)
+    out_sdpa_1d, _ = attn_mod._sdpa_with_rel_bias_and_lse(q, k, v, rel_1, pos_2d_c1.view(-1), pos_2d_c1.view(-1), scale=d**-0.5, sliding_window=8, enforce_index_causal=True)
+    assert torch.allclose(out_sdpa_2d, out_sdpa_1d, atol=1e-4)
+    dctx_2d = attn_mod.compute_decode_attn_context_tensors(
+        torch.tensor([0, 1, -1], dtype=torch.int32),
+        torch.tensor([4, 3, 0], dtype=torch.int32),
+        torch.tensor([[3], [2]], dtype=torch.int32),
+        2,
+        block_size=bs,
+        sliding_window=8,
+        rel_extent=16,
+    )
+    assert dctx_2d.positions_i32.shape == (2,)
+    assert dctx_2d.clamped_global.shape == (3 * bs,)

@@ -7,6 +7,7 @@ import os
 
 import torch
 from torch.nn.parameter import Parameter
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.distributed import (
     split_tensor_along_last_dim,
@@ -86,12 +87,16 @@ class HPURowParallelLinear(RowParallelLinear):
 
         assert self.quant_method is not None
 
-        # Determine total tokens for chunking decision
-        input_shape = input_parallel.shape
+        is_qa = isinstance(input_parallel, QuantizedActivation)
+        input_shape = input_parallel.orig_shape if is_qa else input_parallel.shape
+        input_ndim = len(input_shape)
+        input_dtype = input_parallel.orig_dtype if is_qa else input_parallel.dtype
+        input_device = input_parallel.data.device if is_qa else input_parallel.device
+
         # For 3D input [batch, seq, hidden], total_tokens = batch * seq
         # For 2D input [tokens, hidden], total_tokens = tokens
-        if input_parallel.ndim == 3:
-            batch_size, seq_len, _ = input_parallel.shape
+        if input_ndim == 3:
+            batch_size, seq_len, _ = input_shape
             total_tokens = batch_size * seq_len
         else:
             total_tokens = input_shape[0]
@@ -106,13 +111,13 @@ class HPURowParallelLinear(RowParallelLinear):
             torch._dynamo.graph_break()
 
             # Determine if input is 3D [batch, seq, hidden] or 2D [batch*seq, hidden]
-            is_3d = input_parallel.ndim == 3
+            is_3d = input_ndim == 3
 
             if is_3d:
                 # Input is [batch, seq, hidden]
                 # For multi-token sequences (prompts): chunk along sequence dimension
                 # For single-token batches (decodes): chunk along batch dimension
-                batch_size, seq_len, hidden_dim = input_parallel.shape
+                batch_size, seq_len, hidden_dim = input_shape
                 if seq_len > 1:
                     # Chunk along sequence dimension for prompts
                     chunk_dim = 1
@@ -124,16 +129,16 @@ class HPURowParallelLinear(RowParallelLinear):
                 output = torch.empty(batch_size,
                                      seq_len,
                                      self.output_size_per_partition,
-                                     dtype=input_parallel.dtype,
-                                     device=input_parallel.device)
+                                     dtype=input_dtype,
+                                     device=input_device)
             else:
                 # Input is [batch*seq, hidden], chunk along batch dimension
-                total_tokens, hidden_dim = input_parallel.shape
+                total_tokens, hidden_dim = input_shape
                 chunk_dim = 0
                 output = torch.empty(total_tokens,
                                      self.output_size_per_partition,
-                                     dtype=input_parallel.dtype,
-                                     device=input_parallel.device)
+                                     dtype=input_dtype,
+                                     device=input_device)
 
             chunk_size = (total_tokens + self.num_chunks - 1) // self.num_chunks
 
@@ -153,7 +158,36 @@ class HPURowParallelLinear(RowParallelLinear):
                     continue
 
                 # Slice input along the appropriate dimension
-                if is_3d:
+                if is_qa:
+                    if is_3d:
+                        qa_data = input_parallel.data.view(batch_size, seq_len, hidden_dim)
+                        qa_scale = input_parallel.scale.view(batch_size, seq_len, -1)
+                        if chunk_dim == 1:
+                            c_data = qa_data[:, start_idx:end_idx, :].contiguous()
+                            c_scale = qa_scale[:, start_idx:end_idx, :].contiguous()
+                            c_shape = torch.Size((batch_size, end_idx - start_idx, hidden_dim))
+                        else:
+                            c_data = qa_data[start_idx:end_idx, :, :].contiguous()
+                            c_scale = qa_scale[start_idx:end_idx, :, :].contiguous()
+                            c_shape = torch.Size((end_idx - start_idx, seq_len, hidden_dim))
+                        input_chunk = QuantizedActivation(
+                            data=c_data.view(-1, hidden_dim),
+                            scale=c_scale.view(-1, c_scale.shape[-1]),
+                            orig_dtype=input_parallel.orig_dtype,
+                            orig_shape=c_shape,
+                            quant_key=input_parallel.quant_key,
+                        )
+                    else:
+                        c_data = input_parallel.data[start_idx:end_idx].contiguous()
+                        c_scale = input_parallel.scale[start_idx:end_idx].contiguous()
+                        input_chunk = QuantizedActivation(
+                            data=c_data,
+                            scale=c_scale,
+                            orig_dtype=input_parallel.orig_dtype,
+                            orig_shape=torch.Size((end_idx - start_idx, hidden_dim)),
+                            quant_key=input_parallel.quant_key,
+                        )
+                elif is_3d:
                     if chunk_dim == 1:
                         # Chunking along sequence dimension
                         input_chunk = input_parallel[:, start_idx:end_idx, :]

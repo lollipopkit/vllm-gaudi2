@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Builds the gdn_tpc and inkling2_tpc torch extensions: python setup.py build_ext --inplace
+# Builds the gdn_tpc, gaudi2_fp8_tpc, and inkling2_tpc torch extensions: python setup.py build_ext --inplace
 from pathlib import Path
 
 import pybind11
@@ -25,6 +25,7 @@ setup(
     name="gaudi2_tpc_ops",
     ext_modules=[
         _ext("gdn_tpc", "gdn_tpc_op.cpp"),
+        _ext("gaudi2_fp8_tpc", "gaudi2_fp8_tpc_op.cpp"),
         _ext("inkling2_tpc", "inkling2_tpc_op.cpp"),
     ],
     cmdclass={"build_ext": cpp_extension.BuildExtension},

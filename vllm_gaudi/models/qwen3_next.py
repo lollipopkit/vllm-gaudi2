@@ -2,15 +2,30 @@ import os
 from itertools import islice
 
 import torch
-from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_reduce_scatter,
+)
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation, get_input_quant_key
+from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
+    Qwen3NextDecoderLayer,
     Qwen3NextModel as UpstreamQwen3NextModel,
     Qwen3NextSparseMoeBlock,
 )
 from vllm.sequence import IntermediateTensors
 from vllm_gaudi.models.layer_groups import LayerGroupModel, use_layer_groups
 from vllm_gaudi.models.utils import sequence_parallel_chunk
+from vllm_gaudi.ops.hpu_gaudi2_fp8_tpc import (
+    can_fuse_add_rms_norm_f8,
+    fused_add_rms_norm_f8,
+    fused_add_rms_norm_f8_bf16,
+    has_add_rms_norm_f8,
+    within_fp8_tpc_max_rows,
+)
 
 # Larger decode batches keep per-layer graphs by default; configurable via env for A/B testing.
 HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE = int(os.environ.get("VLLM_HPU_QWEN3_LAYER_GROUP_MAX_BS", "16"))
@@ -58,8 +73,24 @@ class HpuQwen3NextModel(LayerGroupModel, UpstreamQwen3NextModel):
         kinds = super().hpu_layer_kinds()
         layers = tuple(islice(self.layers, self.start_layer, self.end_layer))
         if kinds is None:
-            return tuple(type(layer.mlp) for layer in layers)
-        return tuple((k, type(layer.mlp)) for k, layer in zip(kinds, layers))
+            kinds = tuple(None for _ in layers)
+
+        def _layer_sig(base_k, layer):
+            lin = getattr(layer, "linear_attn", None)
+            mlp = getattr(layer, "mlp", None)
+            down = getattr(mlp, "down_proj", None) if mlp is not None else None
+            return (
+                base_k,
+                type(mlp),
+                getattr(layer, "_hpu_fuse_input_norm_f8", 0),
+                getattr(layer, "_hpu_fuse_post_attn_norm_f8", False),
+                getattr(lin, "_use_tpc_gdn_prep", False),
+                getattr(lin, "_use_tpc_gdn_gated_norm", False),
+                getattr(lin, "_ba_consumes_prequant", False),
+                get_input_quant_key(down) if down is not None else None,
+            )
+
+        return tuple(_layer_sig(k, layer) for k, layer in zip(kinds, layers))
 
     def forward(
         self,
@@ -110,6 +141,125 @@ class HpuQwen3NextModel(LayerGroupModel, UpstreamQwen3NextModel):
 
 # Save original forwards before patching
 _orig_qwen3next_attention_forward = Qwen3NextAttention.forward
+_orig_qwen3next_decoder_layer_forward = Qwen3NextDecoderLayer.forward
+
+
+def _configure_qwen3_decoder_layer_fp8_norms(model) -> int:
+    """Resolve static per-layer Add+RMSNorm+FP8 fusion flags after weights are loaded."""
+    if not has_add_rms_norm_f8():
+        return 0
+    from vllm_gaudi.models.qwen3_5 import HPUGatedDeltaNetAttention
+
+    count = 0
+    for layer in model.modules():
+        if not isinstance(layer, Qwen3NextDecoderLayer):
+            continue
+        if layer.use_attn_reduce_scatter_for_moe:
+            continue
+        in_norm = getattr(layer, "input_layernorm", None)
+        in_w = getattr(in_norm, "weight", None)
+        in_hidden = in_w.shape[0] if in_w is not None else 0
+        if in_norm is not None and can_fuse_add_rms_norm_f8(in_norm, in_hidden):
+            if layer.layer_type == "full_attention":
+                if get_input_quant_key(layer.self_attn.qkv_proj) == kFp8DynamicTokenSym:
+                    layer._hpu_fuse_input_norm_f8 = 1
+                    count += 1
+            elif layer.layer_type == "linear_attention":
+                lin = layer.linear_attn
+                if (isinstance(lin, HPUGatedDeltaNetAttention) and not hasattr(lin, "in_proj_qkv")
+                        and hasattr(lin, "in_proj_qkvz")
+                        and get_input_quant_key(lin.in_proj_qkvz) == kFp8DynamicTokenSym):
+                    ba_fp8 = hasattr(lin, "in_proj_ba") and get_input_quant_key(lin.in_proj_ba) == kFp8DynamicTokenSym
+                    # 3 = both in_proj_qkvz and in_proj_ba consume FP8 (3-out); 2 = dual-output FP8 + BF16.
+                    layer._hpu_fuse_input_norm_f8 = 3 if ba_fp8 else 2
+                    count += 1
+        post_norm = getattr(layer, "post_attention_layernorm", None)
+        post_w = getattr(post_norm, "weight", None)
+        post_hidden = post_w.shape[0] if post_w is not None else 0
+        mlp = getattr(layer, "mlp", None)
+        if (post_norm is not None and can_fuse_add_rms_norm_f8(post_norm, post_hidden)
+                and mlp is not None and not isinstance(mlp, Qwen3NextSparseMoeBlock)
+                and getattr(mlp, "expert_gate", None) is None
+                and hasattr(mlp, "gate_up_proj")
+                and get_input_quant_key(mlp.gate_up_proj) == kFp8DynamicTokenSym):
+            layer._hpu_fuse_post_attn_norm_f8 = True
+            count += 1
+    return count
+
+
+def _hpu_qwen3next_decoder_layer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    positions: torch.Tensor,
+    **kwargs: object,
+):
+    fuse_in = getattr(self, "_hpu_fuse_input_norm_f8", 0)
+    fuse_post = getattr(self, "_hpu_fuse_post_attn_norm_f8", False)
+    if (not fuse_in and not fuse_post) or self.use_attn_reduce_scatter_for_moe:
+        return _orig_qwen3next_decoder_layer_forward(self, hidden_states, residual, positions, **kwargs)
+
+    use_tpc_rows = within_fp8_tpc_max_rows(hidden_states)
+    prequant_f8 = None
+    prequant_sc = None
+    if residual is None:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+    elif use_tpc_rows and fuse_in == 1 and hidden_states.dtype == torch.bfloat16 and residual.dtype == torch.bfloat16:
+        hidden_states, residual = fused_add_rms_norm_f8(self.input_layernorm, hidden_states, residual)
+    elif use_tpc_rows and fuse_in == 2 and hidden_states.dtype == torch.bfloat16 and residual.dtype == torch.bfloat16:
+        prequant_f8, prequant_sc, residual, hidden_states = fused_add_rms_norm_f8_bf16(
+            self.input_layernorm, hidden_states, residual
+        )
+    elif use_tpc_rows and fuse_in == 3 and hidden_states.dtype == torch.bfloat16 and residual.dtype == torch.bfloat16:
+        qa_in, residual = fused_add_rms_norm_f8(self.input_layernorm, hidden_states, residual)
+        prequant_f8 = qa_in.data
+        prequant_sc = qa_in.scale
+        # Both in_proj_qkvz and in_proj_ba consume prequant_f8; residual carries orig_shape/dtype/device metadata.
+        hidden_states = residual
+    else:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+    if self.layer_type == "linear_attention":
+        if prequant_f8 is not None:
+            hidden_states = self.linear_attn(
+                hidden_states=hidden_states,
+                prequant_f8=prequant_f8,
+                prequant_scale=prequant_sc,
+            )
+        else:
+            hidden_states = self.linear_attn(hidden_states=hidden_states)
+    elif self.layer_type == "full_attention":
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            positions=positions,
+        )
+    else:
+        raise ValueError("Invalid layer_type")
+
+    if self.layer_scale:
+        if len(hidden_states.shape) == 2:
+            hidden_states = hidden_states * (self.attn_layer_scale.to(hidden_states.dtype)[0] + 1)
+        else:
+            hidden_states = hidden_states * (self.attn_layer_scale.to(hidden_states.dtype) + 1)
+
+    if use_tpc_rows and fuse_post and hidden_states.dtype == torch.bfloat16 and residual.dtype == torch.bfloat16:
+        hidden_states, residual = fused_add_rms_norm_f8(self.post_attention_layernorm, hidden_states, residual)
+    else:
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    hidden_states = self.mlp(hidden_states)
+
+    if self.layer_scale:
+        if len(hidden_states.shape) == 2:
+            hidden_states = hidden_states * (self.ffn_layer_scale.to(hidden_states.dtype)[0] + 1)
+        else:
+            assert len(hidden_states.shape) == len(self.ffn_layer_scale.shape), (
+                f"shape must be the same {len(hidden_states.shape)}, "
+                f"{len(self.ffn_layer_scale.shape)}"
+            )
+            hidden_states = hidden_states * (self.ffn_layer_scale.to(hidden_states.dtype) + 1)
+
+    return hidden_states, residual
 
 
 # ====================================================================
@@ -123,18 +273,18 @@ _orig_qwen3next_attention_forward = Qwen3NextAttention.forward
 # ====================================================================
 def _hpu_qwen3next_attention_forward(self, positions, hidden_states):
 
-    # Patch any 3D layout (BS > 1):
+    # Patch any 3D layout (BS > 1) or pre-quantized FP8 activation:
     #   Decode:  hidden_states [B, 1, H]
     #   Prefill: hidden_states [B, L, H]
     #
     # Upstream forward assumes 2D (tokens, dim) for attn_output but
     # preserves 3D for gate when hidden_states is 3D, causing a shape
     # mismatch in `attn_output * gate`.  We flatten both to 2D.
-    is_3d = (hidden_states is not None and hidden_states.dim() == 3)
-    if not is_3d:
+    is_prequant = isinstance(hidden_states, QuantizedActivation)
+    orig_shape = hidden_states.orig_shape if is_prequant else (hidden_states.shape if hidden_states is not None else ())
+    is_3d = (len(orig_shape) == 3)
+    if not is_3d and not is_prequant:
         return _orig_qwen3next_attention_forward(self, positions, hidden_states)
-
-    orig_shape = hidden_states.shape
 
     qkv, _ = self.qkv_proj(hidden_states)
 
@@ -239,6 +389,7 @@ def apply_hpu_qwen3_residual_fix(model) -> bool:
 
     if isinstance(inner_model, (Qwen3_5Model, UpstreamQwen3NextModel)):
         configure_hpu_qwen3_gated_fp8(inner_model)
+        _configure_qwen3_decoder_layer_fp8_norms(inner_model)
 
     # Check if it's a Qwen3_5Model or Qwen3NextModel that needs the fix
     if isinstance(inner_model, Qwen3_5Model):
@@ -257,4 +408,5 @@ def apply_hpu_qwen3_residual_fix(model) -> bool:
 # Apply all patches
 # ====================================================================
 Qwen3NextAttention.forward = _hpu_qwen3next_attention_forward
+Qwen3NextDecoderLayer.forward = _hpu_qwen3next_decoder_layer_forward
 Qwen3NextSparseMoeBlock.forward = _hpu_qwen3next_sparse_moe_forward

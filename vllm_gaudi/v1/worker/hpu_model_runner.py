@@ -6890,9 +6890,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # fullgraph).
                 Sampler.apply_logits_processors = torch.compiler.disable(  # type: ignore[method-assign]
                     Sampler.apply_logits_processors)
-                # The penalty arithmetic on the device-side statistics has fixed shapes per batch bucket.
-                self.sampler.compile_penalties(self._compile)
-                self.sampler = self._compile(self.sampler, fullgraph=False)
+                # Single-graph pure-tensor fast paths eliminate outer SamplingMetadata Dynamo guards
+                # and graph breaks for standard greedy / random / capped top-k / top-p + penalty steps.
+                if hasattr(self.sampler, "compile_sampler"):
+                    self.sampler.compile_sampler(self._compile)
+                else:
+                    self.sampler.compile_penalties(self._compile)
+                    self.sampler = self._compile(self.sampler, fullgraph=False)
                 # The spec-decode drafter (e.g. MTP / DFlash) otherwise runs eagerly: ~11 ms of host time
                 # per step for one decoder layer. Mamba2 hybrid drafters use _maybe_compile_drafter below.
                 drafter_model = getattr(getattr(self, "drafter", None), "model", None)
@@ -7294,12 +7298,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # (temperature, top_p, top_k, batch_changed)
             (0.0, 1.0, 0, True),  # Greedy sampling
             (1.0, 1.0, 0, True),  # Random sampling with temp=1.0
+            (0.1, 1.0, 50, True),  # Top-k only (e.g. LFM3 default)
             (0.7, 0.9, 50, True),  # Common creative settings
             (0.3, 0.95, 20, True),  # Conservative settings
             (1.2, 0.8, 100, True),  # High temperature settings
             (0.8, 0.85, 0, True),  # Different top-p sampling
             (0.0, 1.0, 0, False),  # Greedy sampling
             (1.0, 1.0, 0, False),  # Random sampling with temp=1.0
+            (0.1, 1.0, 50, False),  # Top-k only (e.g. LFM3 default)
             (0.7, 0.9, 50, False),  # Common creative settings
             (0.3, 0.95, 20, False),  # Conservative settings
             (1.2, 0.8, 100, False),  # High temperature settings
@@ -7350,7 +7356,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if not self.is_pooling_model:
                 dummy_logits = self.model.compute_logits(dummy_hidden_states)
                 for temp, top_p, top_k, batch_changed in sampling_configs:
-                    # Clear previous sampling state
+                    # Clear previous sampling state and cached SamplingMetadata so batch_changed=False
+                    # builds metadata matching the current (temp, top_p, top_k) config.
+                    self._cached_sampling_metadata.clear()
                     self.input_batch.top_p_reqs = set()
                     self.input_batch.top_k_reqs = set()
 
@@ -7363,14 +7371,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                         if temp == 0.0:  # Greedy sampling
                             self.input_batch.greedy_reqs.add(req_id)
+                            self.input_batch.temperature_cpu[i] = -1.0
                         else:  # Random sampling
                             self.input_batch.random_reqs.add(req_id)
+                            self.input_batch.temperature_cpu[i] = temp
 
                         # IMPORTANT: Also update top_p_reqs and top_k_reqs
                         # to ensure correct sampling path is taken
+                        self.input_batch.top_p_cpu[i] = top_p
                         if top_p < 1.0:
                             self.input_batch.top_p_reqs.add(req_id)
-                            self.input_batch.top_p_cpu[i] = top_p
                         if 0 < top_k < self.input_batch.vocab_size:
                             self.input_batch.top_k_reqs.add(req_id)
                             self.input_batch.top_k_cpu[i] = top_k
@@ -7386,6 +7396,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                              logits_device=dummy_logits,
                                                                              request_ids=dummy_req_ids,
                                                                              pad_to=dummy_logits.shape[0])
+                    fallback_fn = getattr(self.sampler, "_fallback_fn", None)
+                    if fallback_fn is not None and batch_changed and (temp, top_p, top_k) in ((0.0, 1.0, 0),
+                                                                                              (0.7, 0.9, 50)):
+                        fallback_fn(dummy_logits, _sampling_metadata, False, None)
                     if self.speculative_config is not None:
                         # The draft rows' sampling constraints: one row per
                         # request with one draft token, as float32 logits.
@@ -7396,9 +7410,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self.input_batch.random_reqs = set()
                     self.input_batch.req_output_token_ids = []
                 if self.input_batch.penalty_stats is not None:
-                    self.sampler.warmup_penalties(self.input_batch.penalty_stats, dummy_logits.shape[0])
+                    self.sampler.warmup_penalties(self.input_batch.penalty_stats, dummy_logits.shape[0],
+                                                  dummy_logits.dtype)
 
             # Cleanup after batch has been warmed up
+            self._cached_sampling_metadata.clear()
             self.input_batch.req_id_to_index = {}
             self.input_batch.top_p_reqs = set()
             self.input_batch.top_k_reqs = set()
@@ -8416,8 +8432,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             dsa_variants = sum(
                 len(self._dsa_warmup_req_blocks(bs, blocks, self.attn_block_size))
                 for bs, _, blocks in self.bucketing_manager.decode_buckets)
-            cache_size_limit = 1 + multiplier * (len(self.bucketing_manager.prompt_buckets) +
-                                                 len(self.bucketing_manager.decode_buckets) + dsa_variants)
+            max_code_visits = getattr(getattr(self.get_model(), "model", None), "_hpu_max_code_visits", 1)
+            if self.compile_config.regional_compilation and max_code_visits > 1:
+                multiplier = max(multiplier, max_code_visits + 5)
+            cache_size_limit = max(
+                512 if max_code_visits > 1 else 256,
+                1 + multiplier * (len(self.bucketing_manager.prompt_buckets) +
+                                  len(self.bucketing_manager.decode_buckets) + dsa_variants),
+            )
             torch._dynamo.config.cache_size_limit = max(cache_size_limit, torch._dynamo.config.cache_size_limit)
             # Multiply by 8 to follow the original default ratio between
             # the cache_size_limit and accumulated_cache_size_limit

@@ -582,6 +582,83 @@ int Run(int H, int I, int E, int topK, int B)
                is_first, H, topK, B, cyc_s, rel_p, max_s_err, ok_s ? "PASS" : "FAIL");
         if (!ok_s)
             return 1;
+
+        // 4b. Simulate 8-input PACK_FULL_STATE mode (kvWidth < H on first=0, kvWidth > H on first=1)
+        const int kvW = is_first ? (H + 128) : 128;
+        const int pOff = kvW + H;
+        const int pTotal = kvW + 2 * H;
+        const uint64_t pcsSz[] = {(uint64_t)pTotal, 3u, (uint64_t)numSlots};
+        const uint64_t pkvSz[] = {(uint64_t)kvW, 3u, (uint64_t)B};
+        const uint64_t patSz[] = {(uint64_t)H, 3u, (uint64_t)B};
+        const uint64_t pfsSz[] = {(uint64_t)pTotal, 3u, (uint64_t)B};
+        test::Tensor<uint16_t, 3> p_cs(pcsSz), p_kv(pkvSz), p_at(patSz), p_fs(pfsSz);
+        test::Tensor<uint16_t, 2> p_part(hbSz);
+        for (size_t i = 0; i < (size_t)pTotal * 3 * numSlots; i++) p_cs.Data()[i] = floatToBf16(snd(srng));
+        for (size_t i = 0; i < (size_t)kvW * 3 * B; i++) p_kv.Data()[i] = floatToBf16(snd(srng));
+        for (size_t i = 0; i < (size_t)H * 3 * B; i++) p_at.Data()[i] = floatToBf16(snd(srng));
+        for (int b = 0; b < B; b++)
+        {
+            const int slot = load_slots.Data()[b];
+            for (int row = 0; row < 3; row++)
+                for (int h = 0; h < H; h++)
+                    p_cs.Data()[((size_t)slot * 3 + row) * pTotal + pOff + h] =
+                        conv_st.Data()[((size_t)slot * 3 + row) * totalDim + streamOffset + h];
+        }
+
+        tpc_lib_api::HabanaKernelParams inp = {};
+        tpc_lib_api::HabanaKernelInstantiation instp = {};
+        std::vector<tpc_lib_api::Tensor> insp(8), outsp(2);
+        std::vector<tpc_lib_api::TensorAccessPattern> iapp(8), oapp(2);
+        std::vector<char> elfp(1 << 20);
+        inp.deviceId = tpc_lib_api::DEVICE_ID_GAUDI2;
+        strcpy(inp.guid.name, Inkling2MoeSumSconvResDecodeGaudi2::kGuid);
+        inp.inputTensors = insp.data(); inp.inputTensorNr = 8;
+        inp.outputTensors = outsp.data(); inp.outputTensorNr = 2;
+        Describe(&insp[0], tpc_lib_api::DATA_BF16, mp);
+        Describe(&insp[1], tpc_lib_api::DATA_BF16, p_cs);
+        Describe(&insp[2], tpc_lib_api::DATA_I32, load_slots);
+        Describe(&insp[3], tpc_lib_api::DATA_BF16, wt);
+        Describe(&insp[4], tpc_lib_api::DATA_BF16, part_res);
+        Describe(&insp[5], tpc_lib_api::DATA_BF16, attn_out);
+        Describe(&insp[6], tpc_lib_api::DATA_BF16, p_kv);
+        Describe(&insp[7], tpc_lib_api::DATA_BF16, p_at);
+        Describe(&outsp[0], tpc_lib_api::DATA_BF16, p_part);
+        Describe(&outsp[1], tpc_lib_api::DATA_BF16, p_fs);
+        Inkling2MoeSumSconvResDecodeGaudi2::Params spp = {outScale, is_first, pOff};
+        inp.nodeParams.nodeParams = &spp; inp.nodeParams.nodeParamsSize = sizeof(spp);
+        instp.inputTensorAccessPattern = iapp.data(); instp.outputTensorAccessPattern = oapp.data();
+        instp.kernel.kernelElf = elfp.data(); instp.kernel.elfSize = elfp.size();
+        if (InstantiateTpcKernel(&inp, &instp) != tpc_lib_api::GLUE_SUCCESS) { printf("sum_sconv_pack glue failed\n"); return 1; }
+        std::vector<TensorDesc2> dp = {mp.GetTensorDescriptor(), p_cs.GetTensorDescriptor(),
+                                       load_slots.GetTensorDescriptor(), wt.GetTensorDescriptor(),
+                                       part_res.GetTensorDescriptor(), attn_out.GetTensorDescriptor(),
+                                       p_kv.GetTensorDescriptor(), p_at.GetTensorDescriptor(),
+                                       p_part.GetTensorDescriptor(), p_fs.GetTensorDescriptor()};
+        VPEStats stp;
+        const unsigned cyc_p = tpc_tests::RunSimulation(inp, instp, dp, stp);
+        int pack_mismatches = 0;
+        for (size_t i = 0; i < (size_t)H * B; i++)
+            if (p_part.Data()[i] != new_part.Data()[i])
+                pack_mismatches++;
+        for (int b = 0; b < B; b++)
+            for (int row = 0; row < 3; row++)
+            {
+                const uint16_t* dst = &p_fs.Data()[((size_t)b * 3 + row) * pTotal];
+                for (int c = 0; c < kvW; c++)
+                    if (dst[c] != p_kv.Data()[((size_t)b * 3 + row) * kvW + c])
+                        pack_mismatches++;
+                for (int h = 0; h < H; h++)
+                {
+                    if (dst[kvW + h] != p_at.Data()[((size_t)b * 3 + row) * H + h])
+                        pack_mismatches++;
+                    if (dst[kvW + H + h] != new_st.Data()[((size_t)b * 3 + row) * H + h])
+                        pack_mismatches++;
+                }
+            }
+        printf("SUM_SCONV_PACK(first=%d, kvW=%d) H=%d topK=%d B=%d | cyc=%u | mismatches=%d -> %s\n",
+               is_first, kvW, H, topK, B, cyc_p, pack_mismatches, pack_mismatches == 0 ? "PASS" : "FAIL");
+        if (pack_mismatches != 0)
+            return 1;
     }
     return 0;
 }

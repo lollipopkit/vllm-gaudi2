@@ -45,6 +45,7 @@ constexpr const char* kMoeGateTopkGuid = "inkling2_moe_gate_topk_gaudi2";
 constexpr const char* kMoeGateGemvSplitkSchema = "custom_op::inkling2_moe_gate_gemv_splitk";
 constexpr const char* kMoeGateGemvSplitkGuid = "inkling2_moe_gate_gemv_splitk_gaudi2";
 constexpr const char* kMoeSumSconvResSchema = "custom_op::inkling2_moe_sum_sconv_res_decode";
+constexpr const char* kMoeSumSconvPackSchema = "custom_op::inkling2_moe_sum_sconv_pack_decode";
 constexpr const char* kMoeSumSconvResGuid = "inkling2_moe_sum_sconv_res_decode_gaudi2";
 
 using W13Params = inkling2_tpc::MoeW13Params;
@@ -331,6 +332,23 @@ std::shared_ptr<void> FillMoeSumSconvResParams(const at::Stack& inputs, size_t& 
     return params;
 }
 
+habana::PartialOutputMetaDataVector MoeSumSconvPackOutputMeta(const at::Stack& inputs)
+{
+    const auto conv_state = inputs[1].toTensor();   // [numSlots, 3, totalDim]
+    const auto partial_res = inputs[4].toTensor();  // [B, H]
+    return {{c10::ScalarType::BFloat16, {partial_res.size(0), partial_res.size(1)}},
+            {c10::ScalarType::BFloat16, {partial_res.size(0), 3, conv_state.size(2)}}};
+}
+
+std::shared_ptr<void> FillMoeSumSconvPackParams(const at::Stack& inputs, size_t& size)
+{
+    HPU_PARAMS_STUB(MoeSumSconvResParams);
+    params->outScale = static_cast<float>(inputs[8].toDouble());
+    params->isFirst = static_cast<int>(inputs[9].toInt());
+    params->streamOffset = static_cast<int>(inputs[10].toInt());
+    return params;
+}
+
 bool Register()
 {
     habana::custom_op::registerUserCustomOp(kW13Schema, kW13Guid, W13OutputMeta, FillW13Params);
@@ -361,6 +379,8 @@ bool Register()
                                             MoeGateGemvSplitkOutputMeta, FillNoParams);
     habana::custom_op::registerUserCustomOp(kMoeSumSconvResSchema, kMoeSumSconvResGuid, MoeSumSconvResOutputMeta,
                                             FillMoeSumSconvResParams);
+    habana::custom_op::registerUserCustomOp(kMoeSumSconvPackSchema, kMoeSumSconvResGuid, MoeSumSconvPackOutputMeta,
+                                            FillMoeSumSconvPackParams);
     return true;
 }
 
@@ -643,6 +663,48 @@ std::tuple<at::Tensor, at::Tensor> MoeSumSconvResDecodeMeta(at::Tensor, at::Tens
     return {partial_res.new_empty_symint({partial_res.sym_size(0), partial_res.sym_size(1)}, opts),
             partial_res.new_empty_symint({partial_res.sym_size(0), 3, partial_res.sym_size(1)}, opts)};
 }
+
+std::tuple<at::Tensor, at::Tensor> MoeSumSconvPackDecode(at::Tensor moe_partial, at::Tensor conv_state,
+                                                         at::Tensor load_slots, at::Tensor weight_t,
+                                                         at::Tensor partial_res, at::Tensor attn_out,
+                                                         at::Tensor new_kv_state, at::Tensor new_attn_state,
+                                                         double out_scale, int64_t is_first, int64_t stream_offset)
+{
+    TORCH_CHECK(moe_partial.is_contiguous() && conv_state.is_contiguous() && load_slots.is_contiguous() &&
+                    weight_t.is_contiguous() && partial_res.is_contiguous() && attn_out.is_contiguous() &&
+                    new_kv_state.is_contiguous() && new_attn_state.is_contiguous(),
+                "inkling2_moe_sum_sconv_pack_decode expects contiguous tensors");
+    TORCH_CHECK(moe_partial.scalar_type() == c10::ScalarType::BFloat16 &&
+                    conv_state.scalar_type() == c10::ScalarType::BFloat16 &&
+                    load_slots.scalar_type() == c10::ScalarType::Int &&
+                    weight_t.scalar_type() == c10::ScalarType::BFloat16 &&
+                    partial_res.scalar_type() == c10::ScalarType::BFloat16 &&
+                    attn_out.scalar_type() == c10::ScalarType::BFloat16 &&
+                    new_kv_state.scalar_type() == c10::ScalarType::BFloat16 &&
+                    new_attn_state.scalar_type() == c10::ScalarType::BFloat16,
+                "inkling2_moe_sum_sconv_pack_decode dtype mismatch");
+    const int64_t b = partial_res.size(0), h = partial_res.size(1);
+    TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(1) == 3 && new_kv_state.dim() == 3 &&
+                    new_kv_state.size(0) == b && new_kv_state.size(1) == 3 && new_attn_state.dim() == 3 &&
+                    new_attn_state.size(0) == b && new_attn_state.size(1) == 3 && new_attn_state.size(2) == h &&
+                    new_kv_state.size(2) <= 2 * h &&
+                    stream_offset == new_kv_state.size(2) + h &&
+                    conv_state.size(2) == stream_offset + h,
+                "inkling2_moe_sum_sconv_pack_decode shape/offset mismatch");
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kMoeSumSconvPackSchema);
+    auto outs = op.execute({moe_partial, conv_state, load_slots, weight_t, partial_res, attn_out, new_kv_state,
+                            new_attn_state, out_scale, is_first, stream_offset});
+    return {outs[0], outs[1]};
+}
+
+std::tuple<at::Tensor, at::Tensor> MoeSumSconvPackDecodeMeta(at::Tensor, at::Tensor conv_state, at::Tensor,
+                                                             at::Tensor, at::Tensor partial_res, at::Tensor,
+                                                             at::Tensor, at::Tensor, double, int64_t, int64_t)
+{
+    auto opts = partial_res.options().dtype(c10::ScalarType::BFloat16);
+    return {partial_res.new_empty_symint({partial_res.sym_size(0), partial_res.sym_size(1)}, opts),
+            partial_res.new_empty_symint({partial_res.sym_size(0), 3, conv_state.sym_size(2)}, opts)};
+}
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m)
@@ -685,6 +747,9 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m)
     m.def("inkling2_moe_sum_sconv_res_decode(Tensor moe_partial, Tensor conv_state, Tensor load_slots, "
           "Tensor weight_t, Tensor partial_res, Tensor attn_out, float out_scale, int is_first, "
           "int stream_offset) -> (Tensor, Tensor)");
+    m.def("inkling2_moe_sum_sconv_pack_decode(Tensor moe_partial, Tensor conv_state, Tensor load_slots, "
+          "Tensor weight_t, Tensor partial_res, Tensor attn_out, Tensor new_kv_state, Tensor new_attn_state, "
+          "float out_scale, int is_first, int stream_offset) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m)
 {
@@ -705,6 +770,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m)
     m.impl("inkling2_moe_gate_topk", MoeGateTopk);
     m.impl("inkling2_moe_gate_gemv_splitk", MoeGateGemvSplitk);
     m.impl("inkling2_moe_sum_sconv_res_decode", MoeSumSconvResDecode);
+    m.impl("inkling2_moe_sum_sconv_pack_decode", MoeSumSconvPackDecode);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m)
 {
@@ -725,6 +791,7 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m)
     m.impl("inkling2_moe_gate_topk", MoeGateTopkMeta);
     m.impl("inkling2_moe_gate_gemv_splitk", MoeGateGemvSplitkMeta);
     m.impl("inkling2_moe_sum_sconv_res_decode", MoeSumSconvResDecodeMeta);
+    m.impl("inkling2_moe_sum_sconv_pack_decode", MoeSumSconvPackDecodeMeta);
 }
 
 static const bool kRegistered = Register();

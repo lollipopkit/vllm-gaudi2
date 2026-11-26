@@ -16,7 +16,10 @@ set(TPC_KERNEL_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/inkling2_attn_res_common.h
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/inkling2_blend_rms_norm_common.h
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/inkling2_paged_attn_common.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/inkling2_qkvr_prep_decode_common.h)
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/inkling2_qkvr_prep_decode_common.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/inkling2_moe_sum_sconv_res_decode_common.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gaudi2_fp8_common.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gaudi2_rms_norm_f8_common.h)
 
 # TPC-C source -> TPC ELF -> x86 object exposing _binary___<name>_o_{start,end} for the glue code.
 function(add_tpc_kernel name)
@@ -35,6 +38,15 @@ endfunction()
 
 add_tpc_kernel(gdn_decode_f32_gaudi2)
 add_tpc_kernel(gdn_verify_f32_gaudi2)
+add_tpc_kernel(gaudi2_add_rms_norm_f8_f32w_gaudi2)
+add_tpc_kernel(gaudi2_add_rms_norm_f8_bf16_f32w_gaudi2)
+add_tpc_kernel(gaudi2_add_rms_norm_f8_bf16w_gaudi2)
+add_tpc_kernel(gaudi2_add_rms_norm_f8_bf16_bf16w_gaudi2)
+add_tpc_kernel(gaudi2_sandwich_rms_norm_f8_gaudi2)
+add_tpc_kernel(gaudi2_silu_mul_f8_gaudi2)
+add_tpc_kernel(gdn_prep_decode_gaudi2)
+add_tpc_kernel(gdn_gated_rms_norm_f8_gaudi2)
+add_tpc_kernel(lfm3_short_conv_decode_gaudi2)
 add_tpc_kernel(inkling2_moe_w13_situ_f8_gaudi2)
 add_tpc_kernel(inkling2_moe_w2_f8_gaudi2)
 add_tpc_kernel(inkling2_moe_group_experts_gaudi2)
@@ -45,6 +57,7 @@ add_tpc_kernel(inkling2_moe_gate_topk_e128_gaudi2)
 add_tpc_kernel(inkling2_moe_gate_gemv_splitk_gaudi2)
 add_tpc_kernel(inkling2_moe_gate_gemv_splitk_b1_gaudi2)
 add_tpc_kernel(inkling2_moe_sum_sconv_res_decode_gaudi2)
+add_tpc_kernel(inkling2_moe_sum_sconv_pack_decode_gaudi2)
 add_tpc_kernel(inkling2_attn_res_norm_bf16_gaudi2)
 add_tpc_kernel(inkling2_attn_res_norm_f8_gaudi2)
 add_tpc_kernel(inkling2_attn_res_f32_gaudi2)
@@ -60,6 +73,7 @@ add_tpc_kernel(inkling2_rel_paged_attn_gqa3_gaudi2)
 set(GLUE_SOURCES
     src/gdn_decode_gaudi2.cpp
     src/gdn_verify_gaudi2.cpp
+    src/gaudi2_fp8_ops_gaudi2.cpp
     src/inkling2_moe_gaudi2.cpp
     src/inkling2_attn_res_gaudi2.cpp
     src/inkling2_sconv_norm_gaudi2.cpp
@@ -90,6 +104,7 @@ function(add_tpc_sim_test target src)
 endfunction()
 
 add_tpc_sim_test(gdn_decode_test tests/gdn_decode_test.cpp)
+add_tpc_sim_test(gaudi2_fp8_ops_test tests/gaudi2_fp8_ops_test.cpp)
 add_tpc_sim_test(inkling2_moe_test tests/inkling2_moe_test.cpp)
 add_tpc_sim_test(inkling2_attn_res_test tests/inkling2_attn_res_test.cpp)
 add_tpc_sim_test(inkling2_ops_test tests/inkling2_ops_test.cpp)

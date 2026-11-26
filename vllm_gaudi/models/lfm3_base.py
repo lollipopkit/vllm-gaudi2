@@ -15,7 +15,20 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation, get_input_quant_key
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym
+from vllm_gaudi.ops.hpu_gaudi2_fp8_tpc import (
+    can_fuse_add_rms_norm_f8,
+    can_fuse_sandwich_rms_norm_f8,
+    fused_add_rms_norm_f8,
+    fused_add_rms_norm_f8_bf16,
+    fused_sandwich_rms_norm_f8,
+    has_add_rms_norm_f8,
+    has_sandwich_rms_norm_f8,
+    within_fp8_tpc_max_rows,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -75,9 +88,9 @@ class Lfm3MLP(nn.Module):
         )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor | QuantizedActivation) -> torch.Tensor:
         gate_up, _ = self.w13(x)
-        x, _ = self.w2(self.act_fn(gate_up))
+        x, _ = self.w2(maybe_fused_act_quant(self.act_fn, gate_up, self.w2))
         return x
 
 
@@ -180,17 +193,21 @@ class Lfm3Attention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | QuantizedActivation,
+        prequant_hidden_states: QuantizedActivation | None = None,
     ) -> torch.Tensor:
         # Shape-agnostic: the HPU runner feeds [batch, seq, hidden], others [tokens, hidden].
-        lead = hidden_states.shape[:-1]
-        qkv, _ = self.qkv_proj(hidden_states)
+        lead = (hidden_states.orig_shape[:-1] if isinstance(hidden_states, QuantizedActivation)
+                else hidden_states.shape[:-1])
+        qkv_in = prequant_hidden_states if prequant_hidden_states is not None else hidden_states
+        qkv, _ = self.qkv_proj(qkv_in)
+        # Compute gate before self.attn so any QuantizedActivation does not cross the attention graph break.
+        gate, _ = self.gate_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.q_norm(q.view(*lead, self.num_heads, self.head_dim))
         k = self.k_norm(k.view(*lead, self.num_kv_heads, self.head_dim))
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q.view(*lead, -1), k.view(*lead, -1), v)
-        gate, _ = self.gate_proj(hidden_states)
         attn_output = attn_output.view(*lead, self.num_heads, self.head_dim) * (
             torch.sigmoid(gate).unsqueeze(-1)
         )
@@ -240,6 +257,28 @@ class Lfm3DecoderLayer(nn.Module):
         if self.use_sandwich_norm:
             self.post_operator_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
             self.post_ffn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self._hpu_fuse_op_norm_f8 = 0
+        self._hpu_fuse_ffn_norm_f8 = 0
+
+    def prepare_hpu_constants(self) -> None:
+        op_w = getattr(self.operator_norm, "weight", None)
+        op_hidden = op_w.shape[0] if op_w is not None else 0
+        if (self.is_attention_layer and has_add_rms_norm_f8()
+                and can_fuse_add_rms_norm_f8(self.operator_norm, op_hidden)
+                and get_input_quant_key(self.self_attn.qkv_proj) == kFp8DynamicTokenSym):
+            if get_input_quant_key(self.self_attn.gate_proj) == kFp8DynamicTokenSym:
+                self._hpu_fuse_op_norm_f8 = 1
+            else:
+                self._hpu_fuse_op_norm_f8 = 2
+        ffn_w = getattr(self.ffn_norm, "weight", None)
+        ffn_hidden = ffn_w.shape[0] if ffn_w is not None else 0
+        if get_input_quant_key(self.feed_forward.w13) == kFp8DynamicTokenSym:
+            if (self.use_sandwich_norm and has_sandwich_rms_norm_f8()
+                    and can_fuse_sandwich_rms_norm_f8(self.post_operator_norm, self.ffn_norm, ffn_hidden)):
+                self._hpu_fuse_ffn_norm_f8 = 2
+            elif (not self.use_sandwich_norm and has_add_rms_norm_f8()
+                  and can_fuse_add_rms_norm_f8(self.ffn_norm, ffn_hidden)):
+                self._hpu_fuse_ffn_norm_f8 = 1
 
     def forward(
         self,
@@ -247,23 +286,53 @@ class Lfm3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        prequant_attn = None
+        use_tpc_rows = within_fp8_tpc_max_rows(hidden_states)
         if residual is None:
             residual = hidden_states
             hidden_states = self.operator_norm(hidden_states)
+        elif (use_tpc_rows and self._hpu_fuse_op_norm_f8 == 1 and hidden_states.dtype == torch.bfloat16
+              and residual.dtype == torch.bfloat16):
+            hidden_states, residual = fused_add_rms_norm_f8(self.operator_norm, hidden_states, residual)
+        elif (use_tpc_rows and self._hpu_fuse_op_norm_f8 == 2 and hidden_states.dtype == torch.bfloat16
+              and residual.dtype == torch.bfloat16):
+            orig_shape = hidden_states.shape
+            orig_dtype = hidden_states.dtype
+            out_f8, out_sc, residual, hidden_states = fused_add_rms_norm_f8_bf16(
+                self.operator_norm, hidden_states, residual
+            )
+            prequant_attn = QuantizedActivation(
+                data=out_f8,
+                scale=out_sc,
+                orig_dtype=orig_dtype,
+                orig_shape=orig_shape,
+                quant_key=kFp8DynamicTokenSym,
+            )
         else:
             hidden_states, residual = self.operator_norm(hidden_states, residual)
         if self.is_attention_layer:
-            hidden_states = self.self_attn(positions, hidden_states)
+            hidden_states = self.self_attn(positions, hidden_states, prequant_hidden_states=prequant_attn)
         elif getattr(self.short_conv, "_returns_output", False):
             hidden_states = self.short_conv(hidden_states)
         else:
             output = torch.empty_like(hidden_states)
             self.short_conv(hidden_states, output)
             hidden_states = output
-        if self.use_sandwich_norm:
-            hidden_states = self.post_operator_norm(hidden_states)
-        hidden_states, residual = self.ffn_norm(hidden_states, residual)
-        hidden_states = self.feed_forward(hidden_states)
+        if (use_tpc_rows and self._hpu_fuse_ffn_norm_f8 == 2 and hidden_states.dtype == torch.bfloat16
+                and residual.dtype == torch.bfloat16):
+            ffn_in, residual = fused_sandwich_rms_norm_f8(
+                self.post_operator_norm, self.ffn_norm, hidden_states, residual
+            )
+            hidden_states = self.feed_forward(ffn_in)
+        elif (use_tpc_rows and self._hpu_fuse_ffn_norm_f8 == 1 and hidden_states.dtype == torch.bfloat16
+              and residual.dtype == torch.bfloat16):
+            ffn_in, residual = fused_add_rms_norm_f8(self.ffn_norm, hidden_states, residual)
+            hidden_states = self.feed_forward(ffn_in)
+        else:
+            if self.use_sandwich_norm:
+                hidden_states = self.post_operator_norm(hidden_states)
+            hidden_states, residual = self.ffn_norm(hidden_states, residual)
+            hidden_states = self.feed_forward(hidden_states)
         if self.use_sandwich_norm:
             hidden_states = self.post_ffn_norm(hidden_states)
         return hidden_states, residual
