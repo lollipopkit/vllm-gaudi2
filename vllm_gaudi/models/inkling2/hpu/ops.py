@@ -8,6 +8,7 @@ in fp32 accumulation, rounding once to storage dtype.
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -82,6 +83,93 @@ def compute_log_scaling_tau(
     return 1.0 + alpha * torch.log(ratio)
 
 
+def compact_inkling2_hpu_buckets(
+    prompt_buckets: list[tuple[int, int, int]],
+    decode_buckets: list[tuple[int, int, int]],
+    *,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    max_num_seqs: int,
+    block_size: int,
+    num_hpu_blocks: int | None,
+    use_contiguous_pa: bool = False,
+    use_merged_prefill: bool = False,
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+    """Compact prompt/decode buckets for Inkling2 static-window & TPC paged attention."""
+    if os.environ.get("INKLING2_COMPACT_BUCKETS", "1") == "0":
+        return prompt_buckets, decode_buckets
+
+    new_prompt = prompt_buckets
+    if prompt_buckets and not use_merged_prefill:
+        bss = sorted({bs for bs, _, _ in prompt_buckets})
+        orig_qs = sorted({q for _, q, _ in prompt_buckets})
+        min_q, max_q = orig_qs[0], orig_qs[-1]
+        cand_qs: set[int] = set()
+        q_pow = max(1, block_size)
+        while q_pow <= max_q * 2:
+            cand_qs.add(q_pow)
+            if q_pow >= 1024:
+                cand_qs.add((q_pow * 3) // 2)
+            q_pow *= 2
+        aligned_qs = {
+            math.ceil(q / block_size) * block_size
+            for q in cand_qs
+            if min_q <= math.ceil(q / block_size) * block_size <= max_q
+        } | {min_q, max_q}
+        qs = sorted(q for q in aligned_qs if q <= max_model_len)
+        orig_max_ctx = max(ctx for _, _, ctx in prompt_buckets)
+        if orig_max_ctx <= 0 or max_model_len <= block_size:
+            ctxs = [0]
+        else:
+            max_prompt_ctx = math.ceil((max_model_len - 1) / block_size)
+            if num_hpu_blocks is not None and num_hpu_blocks > 0:
+                max_prompt_ctx = min(max_prompt_ctx, num_hpu_blocks)
+            ctxs = [0, max_prompt_ctx] if max_prompt_ctx > 0 else [0]
+        prompt_set: set[tuple[int, int, int]] = set()
+        for bs in bss:
+            bs_max_q = min(max_model_len, (max_num_batched_tokens // bs // block_size) * block_size)
+            bs_qs = {q for q in qs if bs * q <= max_num_batched_tokens}
+            if bs_max_q >= min_q:
+                bs_qs.add(bs_max_q)
+            bs_ctxs = ctxs if bs == 1 else [0]
+            for q in bs_qs:
+                for ctx in bs_ctxs:
+                    prompt_set.add((bs, q, ctx))
+        new_prompt = sorted(prompt_set)
+
+    new_decode = decode_buckets
+    if decode_buckets and not use_contiguous_pa:
+        orig_bss = sorted({bs for bs, _, _ in decode_buckets})
+        min_bs, max_bs = orig_bss[0], orig_bss[-1]
+        pow2_bss = set()
+        b = 1
+        while b < max_bs:
+            if b >= min_bs:
+                pow2_bss.add(b)
+            b *= 2
+        pow2_bss.update({min_bs, max_bs})
+        orig_max_dec_ctx = max(ctx for _, _, ctx in decode_buckets)
+        max_blocks_per_req = math.ceil(max_model_len / block_size)
+        cand_blks = [1, 8, 32]
+        blk_pow = 64
+        while blk_pow <= max(64, orig_max_dec_ctx):
+            cand_blks.append(blk_pow)
+            blk_pow *= 2
+        dec_set: set[tuple[int, int, int]] = set()
+        for bs in sorted(pow2_bss):
+            bs_max = min(orig_max_dec_ctx, bs * max_blocks_per_req)
+            bs_orig = [ctx for b_i, _, ctx in decode_buckets if b_i == bs]
+            bs_min = min(bs_orig) if bs_orig else max(1, bs)
+            for ctx in cand_blks:
+                if bs <= ctx <= bs_max:
+                    dec_set.add((bs, 1, ctx))
+            dec_set.add((bs, 1, max(bs, min(bs_min, bs_max))))
+            dec_set.add((bs, 1, max(bs, bs_max)))
+        new_decode = sorted(dec_set)
+
+    return new_prompt, new_decode
+
+
 def attn_res(
     stack: torch.Tensor,
     last: torch.Tensor,
@@ -91,6 +179,8 @@ def attn_res(
     norm_eps: float,
     normalize_values: bool = True,
     eps: float = 1e-6,
+    *,
+    stack_valid: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Block attention residual mix over `[stack..., last (+ addend)]`.
 
@@ -102,12 +192,14 @@ def attn_res(
         norm_weight: Optional `[Q, D]` RMSNorm weights; if None, returns fp32.
         norm_eps: RMSNorm epsilon when `norm_weight` is provided.
         normalize_values: If True, mix RMS-normalized source blocks.
+        stack_valid: Optional `[N_stack]` bool mask for fixed-capacity prefill stacks.
 
     Returns:
         `[Q, T, D]` tensor (bf16 if `norm_weight` is not None, else fp32).
     """
     if (
-        last.device.type == "hpu"
+        stack_valid is None
+        and last.device.type == "hpu"
         and last.dtype == torch.bfloat16
         and stack.dtype == torch.bfloat16
         and (addend is None or addend.dtype == torch.bfloat16)
@@ -159,13 +251,25 @@ def attn_res(
     else:
         sources = last_f.unsqueeze(0)  # [1, T, D]
 
+    src_valid: torch.Tensor | None = None
+    if stack_valid is not None and stack.shape[0] > 0:
+        sv = stack_valid.bool()
+        src_valid = torch.cat([sv, sv.new_ones((1,))], dim=0)  # [N]
+        sources = torch.where(src_valid.view(-1, 1, 1), sources, 0.0)
+
     inv_rms = torch.rsqrt(sources.square().mean(dim=-1, keepdim=True) + eps)  # [N, T, 1]
     normed_sources = sources * inv_rms  # [N, T, D]
 
     # logits[q, n, t] = dot(queries[q], normed_sources[n, t]) via explicit matmul
     # (avoids Habana dynamic-shape einsum Reshape bug under torch.compile).
     logits = torch.matmul(normed_sources, queries.float().t()).permute(2, 0, 1)  # [Q, N, T]
+    if src_valid is not None:
+        neg_large = torch.full((), -1e30, dtype=logits.dtype, device=logits.device)
+        logits = torch.where(src_valid.view(1, -1, 1), logits, neg_large)
     probs = torch.softmax(logits, dim=1)  # [Q, N, T]
+    if src_valid is not None:
+        probs = probs * src_valid.view(1, -1, 1).float()
+        probs = probs / probs.sum(dim=1, keepdim=True).clamp(min=1e-30)
 
     values = normed_sources if normalize_values else sources  # [N, T, D]
     # [T, Q, N] @ [T, N, D] -> [T, Q, D] -> [Q, T, D]
@@ -189,13 +293,16 @@ def attn_res_f8(
     normalize_values: bool = True,
     eps: float = 1e-6,
     fp8_max: float = GAUDI2_FP8_MAX,
+    *,
+    stack_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused block attention residual + RMSNorm + per-row FP8 E4M3 quantization.
 
     Returns `(out_bf16 [Q, T, D], out_f8 [Q, T, D] | None, out_scale [Q, T] | None)`.
     """
     if (
-        last.device.type == "hpu"
+        stack_valid is None
+        and last.device.type == "hpu"
         and last.dtype == torch.bfloat16
         and stack.dtype == torch.bfloat16
         and (addend is None or addend.dtype == torch.bfloat16)
@@ -228,7 +335,17 @@ def attn_res_f8(
             float(norm_eps),
             float(fp8_max),
         )
-    out = attn_res(stack, last, addend, queries, norm_weight, norm_eps, normalize_values, eps)
+    out = attn_res(
+        stack,
+        last,
+        addend,
+        queries,
+        norm_weight,
+        norm_eps,
+        normalize_values,
+        eps,
+        stack_valid=stack_valid,
+    )
     return out, None, None
 
 

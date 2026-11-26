@@ -7694,6 +7694,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         if prompt_cfg:
             prompt_bs, prompt_query_len, prompt_num_blocks = prompt_cfg
+            _force_one_ctx_tok = False
 
             if self.is_pooling_model:
                 prompt_total_tokens = [prompt_query_len]
@@ -7715,19 +7716,34 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # so that ctx * block_size + query_len <= max_model_len
                         # and scheduled tokens == prompt_query_len exactly.
                         capped_ctx = max(0, (self.max_model_len - prompt_query_len) // self.block_size)
-                        prompt_num_context_blocks = [capped_ctx]
-                        prompt_total_tokens = [capped_ctx * self.block_size + prompt_query_len]
+                        lookahead = self.vllm_config.num_lookahead_tokens or 0
+                        if (
+                            capped_ctx == 0
+                            and prompt_num_blocks > 0
+                            and prompt_query_len > self.block_size + lookahead
+                        ):
+                            # Keep 1 context token (1 block -> padded to prompt_num_blocks) while keeping
+                            # scheduled_tokens = prompt_query_len - 1 (still lands in prompt_query_len bucket)
+                            # so total_tokens <= max_model_len and the ctx > 0 bucket is genuinely warmed.
+                            prompt_num_context_blocks = [0]
+                            prompt_total_tokens = [prompt_query_len]
+                            _force_one_ctx_tok = True
+                        else:
+                            prompt_num_context_blocks = [capped_ctx]
+                            prompt_total_tokens = [capped_ctx * self.block_size + prompt_query_len]
             for _ in range(prompt_bs):
                 for tokens, context_len in zip(prompt_total_tokens, prompt_num_context_blocks):
+                    sched_q = prompt_query_len - 1 if _force_one_ctx_tok else prompt_query_len
+                    comp_toks = 1 if _force_one_ctx_tok else (context_len * self.block_size)
                     if self.vllm_config.num_lookahead_tokens:
                         # Leave the block space for the drafter's lookahead tokens
                         tokens -= self.vllm_config.num_lookahead_tokens
-                        prompt_query_len -= self.vllm_config.num_lookahead_tokens
+                        sched_q -= self.vllm_config.num_lookahead_tokens
                     self._add_dummy_request(requests,
                                             scheduled_tokens,
-                                            num_computed_tokens=(context_len * self.block_size),
+                                            num_computed_tokens=comp_toks,
                                             total_tokens=tokens,
-                                            scheduled_tokens=prompt_query_len,
+                                            scheduled_tokens=sched_q,
                                             is_prompt=True)
         if decode_cfg:
             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
@@ -8385,6 +8401,34 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.bucketing_manager.block_size = saved_block_size
         else:
             self.bucketing_manager.decode_buckets = []
+
+        inner_model = getattr(self.get_model(), "model", None)
+        if (
+            hasattr(inner_model, "optimize_hpu_buckets")
+            and not get_config().VLLM_BUCKETING_FROM_FILE
+            and not self.speculative_config
+            and not self.is_pooling_model
+        ):
+            opt_prompt, opt_decode = inner_model.optimize_hpu_buckets(
+                self.bucketing_manager.prompt_buckets,
+                self.bucketing_manager.decode_buckets,
+                max_model_len=self.max_model_len,
+                max_num_batched_tokens=self.max_num_tokens,
+                max_num_seqs=self.max_num_seqs,
+                block_size=self.block_size,
+                num_hpu_blocks=self.bucketing_manager.num_hpu_blocks,
+                use_contiguous_pa=self.use_contiguous_pa,
+                use_merged_prefill=self.use_merged_prefill,
+            )
+            if opt_prompt != self.bucketing_manager.prompt_buckets:
+                self.bucketing_manager.prompt_buckets = opt_prompt
+                self.bucketing_manager.log_generate_info(True)
+            if opt_decode != self.bucketing_manager.decode_buckets:
+                self.bucketing_manager.decode_buckets = opt_decode
+                self.bucketing_manager._fallback_max_ctx = max(
+                    (ctx for _, _, ctx in opt_decode), default=0
+                )
+                self.bucketing_manager.log_generate_info(False)
 
         if self.supports_mm_inputs:
             # Delayed multimodal buckets during warmup until model is loaded.

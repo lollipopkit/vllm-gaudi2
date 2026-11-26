@@ -564,9 +564,8 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
 
         num_tokens, hidden = inputs_embeds.shape
         core = self.loop_core
-        attn_md = get_forward_context().attn_metadata
-        if isinstance(attn_md, dict):
-            attn_md = next(iter(attn_md.values()), None)
+        raw_attn_md = get_forward_context().attn_metadata
+        attn_md = next(iter(raw_attn_md.values()), None) if isinstance(raw_attn_md, dict) else raw_attn_md
         is_decode = attn_md is not None and not getattr(attn_md, "is_prompt", True)
         eff_bs = num_tokens if is_decode else batch_size
 
@@ -613,6 +612,106 @@ class Inkling2HPULoopModel(Inkling2HPUModel):
             )
 
         tau = self._log_scaling_tau(positions)
+        if (
+            not is_decode
+            and not isinstance(raw_attn_md, dict)
+            and os.environ.get("INKLING2_STATIC_PREFILL_STACK", "1") != "0"
+            and len(self.layers) > 0
+            and self.layers[0].conv_state._state_buffer().numel() > 0
+        ):
+            if not getattr(self, "_hpu_slot_meta_ready", False):
+                self._init_hpu_slot_meta()
+            max_blocks = (len(self.layers) + self.block_size - 1) // self.block_size
+            completed_buf = inputs_embeds.new_zeros((max_blocks, num_tokens, hidden))
+            completed_valid = torch.zeros((max_blocks,), dtype=torch.bool, device=inputs_embeds.device)
+            zero_partial = inputs_embeds.new_zeros((num_tokens, hidden))
+            num_completed = 0
+            partial = inputs_embeds
+            visits = self._visits
+            inputs: torch.Tensor | None = torch.stack(
+                [self.layers[0].attn_norm(partial, j) for j in range(self.layers[0].num_attn_inputs)],
+                dim=0,
+            )
+            bank: torch.Tensor | None = None
+            prelude_num_completed = 0
+            prelude_partial: torch.Tensor | None = None
+            prelude_dests: torch.Tensor | None = None
+
+            for visit, (i, pass_idx) in enumerate(visits):
+                looped = pass_idx > 0
+                if i == core.start and not looped:
+                    prelude_num_completed = num_completed
+                    prelude_partial = partial
+                elif i == core.start:
+                    assert prelude_partial is not None
+                    bank = torch.cat(
+                        [
+                            completed_buf[prelude_num_completed + 1 : num_completed],
+                            partial.unsqueeze(0),
+                        ],
+                        dim=0,
+                    )
+                    completed_buf[prelude_num_completed:].zero_()
+                    completed_valid.zero_()
+                    completed_valid[:prelude_num_completed] = True
+                    num_completed = prelude_num_completed
+                    partial = prelude_partial
+                    if prelude_dests is None:
+                        query = self.attn_res.attn_queries[i - 1]
+                        prelude_dests = attn_res(
+                            completed_buf,
+                            prelude_partial,
+                            None,
+                            query,
+                            None,
+                            0.0,
+                            True,
+                            stack_valid=completed_valid,
+                        )
+                    inputs = prelude_dests
+
+                if visit + 1 == len(visits):
+                    next_query, next_norm = self.attn_res.output_query, self.norm
+                else:
+                    next_i, next_pass = visits[visit + 1]
+                    next_query = self.attn_res.attn_queries[next_i - 1]
+                    next_norm = None if next_pass else self.layers[next_i].attn_norm
+
+                if i % self.block_size == 0:
+                    completed_buf[num_completed].copy_(partial)
+                    completed_valid[num_completed] = True
+                    num_completed += 1
+                    partial_in = zero_partial
+                else:
+                    partial_in = partial
+
+                layer = self.layers[i]
+                kv_cache = layer.attn._get_kv_cache_only(pass_idx)
+                conv_refs = layer.conv_states[pass_idx].resolve_cache_refs(attn_md)
+                partial, inputs = layer(
+                    positions,
+                    completed_buf,
+                    partial_in,
+                    inputs,
+                    self.attn_res.mlp_queries[i],
+                    next_query,
+                    None if next_norm is None else next_norm.weight,
+                    0.0 if next_norm is None else next_norm.eps,
+                    tau,
+                    first=False,
+                    pass_idx=0,
+                    batch_size=eff_bs,
+                    decode_ctx=None,
+                    bank=bank if looped else None,
+                    message_query=self.message_queries[i - core.start] if looped else None,
+                    completed_valid=completed_valid,
+                    explicit_kv_cache=kv_cache,
+                    explicit_conv_cache=conv_refs,
+                )
+
+            assert inputs is not None
+            return inputs[0]
+
         decode_ctx = build_decode_attn_context(
             attn_md,
             positions,

@@ -1086,3 +1086,240 @@ def test_prefill_attention_static_chunked_and_sliding_window_slice() -> None:
     )
     assert dctx_2d.positions_i32.shape == (2,)
     assert dctx_2d.clamped_global.shape == (3 * bs,)
+
+
+def test_attn_res_stack_valid_and_compact_buckets(monkeypatch) -> None:
+    torch.manual_seed(42)
+    max_s, t, d = 6, 5, 32
+    full_stack = torch.randn(max_s, t, d, dtype=torch.bfloat16)
+    # Put extreme garbage in unused slots to verify they are completely masked out.
+    last = torch.randn(t, d, dtype=torch.bfloat16)
+    addend = torch.randn(t, d, dtype=torch.bfloat16)
+    queries = torch.randn(3, d, dtype=torch.float32) * (d**-0.5)
+    norm_w = torch.ones(3, d, dtype=torch.bfloat16)
+
+    for k in (0, 1, 3, max_s):
+        buf = full_stack.clone()
+        if k < max_s:
+            buf[k:] = 1e4
+        valid = torch.tensor([i < k for i in range(max_s)], dtype=torch.bool)
+        dyn_stack = full_stack[:k]
+        for norm_vals in (True, False):
+            out_m = ops.attn_res(buf, last, addend, queries, None, 0.0, norm_vals, stack_valid=valid)
+            out_r = ops.attn_res(dyn_stack, last, addend, queries, None, 0.0, norm_vals)
+            assert torch.allclose(out_m, out_r, atol=1e-5), f"k={k} norm={norm_vals} max={(out_m-out_r).abs().max()}"
+            out_mn, f8_m, _ = ops.attn_res_f8(buf, last, addend, queries, norm_w, 1e-6, norm_vals, stack_valid=valid)
+            out_rn, _, _ = ops.attn_res_f8(dyn_stack, last, addend, queries, norm_w, 1e-6, norm_vals)
+            assert f8_m is None
+            assert torch.allclose(out_mn.float(), out_rn.float(), atol=1e-2)
+
+    orig_prompt = [
+        (1, q, c)
+        for q in (128, 256, 384, 512, 640, 768, 896, 1280, 1664, 2048)
+        for c in (0, 1, 2, 4, 7, 14, 26, 63)
+    ]
+    orig_decode = [
+        (bs, 1, c)
+        for bs in (1, 2, 4, 6, 8)
+        for c in (1, 8, 16, 24, 32, 56, 64, 120, 248, 512)
+        if bs <= c <= bs * 64
+    ]
+    monkeypatch.setenv("INKLING2_COMPACT_BUCKETS", "1")
+    opt_p, opt_d = ops.compact_inkling2_hpu_buckets(
+        orig_prompt,
+        orig_decode,
+        max_model_len=8192,
+        max_num_batched_tokens=2048,
+        max_num_seqs=8,
+        block_size=128,
+        num_hpu_blocks=1024,
+        use_contiguous_pa=False,
+    )
+    assert len(opt_p) == 12
+    assert (1, 2048, 0) in opt_p and (1, 2048, 64) in opt_p
+    assert len(opt_d) == 19
+    assert (1, 1, 1) in opt_d and (8, 1, 512) in opt_d
+
+    # Small `num_hpu_blocks` clamps `max_prompt_ctx` safely below `num_hpu_blocks`.
+    opt_p_small, _ = ops.compact_inkling2_hpu_buckets(
+        orig_prompt,
+        orig_decode,
+        max_model_len=8192,
+        max_num_batched_tokens=2048,
+        max_num_seqs=8,
+        block_size=128,
+        num_hpu_blocks=20,
+        use_contiguous_pa=False,
+    )
+    assert max(c for _, _, c in opt_p_small) == 20
+
+    monkeypatch.setenv("INKLING2_COMPACT_BUCKETS", "0")
+    p0, d0 = ops.compact_inkling2_hpu_buckets(
+        orig_prompt,
+        orig_decode,
+        max_model_len=8192,
+        max_num_batched_tokens=2048,
+        max_num_seqs=8,
+        block_size=128,
+        num_hpu_blocks=1024,
+    )
+    assert p0 == orig_prompt and d0 == orig_decode
+
+    # Verify bs > 1 budget ceiling (`bs=3, mbt=2048 -> bs_max_q=640`, no `ctx > 0` for `bs > 1`),
+    # `use_merged_prefill=True` passthrough, and `max_model_len >= 32768` dynamic scaling.
+    monkeypatch.setenv("INKLING2_COMPACT_BUCKETS", "1")
+    bs3_prompt = [(bs, q, c) for bs in (1, 2, 3) for q in (128, 256, 384, 512, 640, 1024, 2048) for c in (0, 8) if bs * q <= 2048]
+    opt_bs3, _ = ops.compact_inkling2_hpu_buckets(
+        bs3_prompt,
+        orig_decode,
+        max_model_len=8192,
+        max_num_batched_tokens=2048,
+        max_num_seqs=8,
+        block_size=128,
+        num_hpu_blocks=1024,
+    )
+    assert (3, 640, 0) in opt_bs3
+    assert all(c == 0 for bs, _, c in opt_bs3 if bs > 1)
+    mp_keep, _ = ops.compact_inkling2_hpu_buckets(
+        orig_prompt,
+        orig_decode,
+        max_model_len=8192,
+        max_num_batched_tokens=2048,
+        max_num_seqs=8,
+        block_size=128,
+        num_hpu_blocks=1024,
+        use_merged_prefill=True,
+    )
+    assert mp_keep == orig_prompt
+    long_p = [(1, q, c) for q in (128, 1024, 8192, 16384, 32768) for c in (0, 64)]
+    long_d = [(16, 1, c) for c in (16, 512, 4096, 8192)]
+    opt_lp, opt_ld = ops.compact_inkling2_hpu_buckets(
+        long_p,
+        long_d,
+        max_model_len=65536,
+        max_num_batched_tokens=32768,
+        max_num_seqs=16,
+        block_size=128,
+        num_hpu_blocks=16384,
+    )
+    assert (1, 24576, 0) in opt_lp and (1, 32768, 512) in opt_lp
+    assert (16, 1, 8192) in opt_ld
+
+    # 3-pass loop static-stack state machine + explicit conv buffer load/store equivalence vs dynamic stack.
+    sconv_mod = sys.modules["inkling2_pkg.hpu.sconv"]
+    num_layers, block_size_ar = 6, 2
+    core_start = 2
+    visits = [(i, 0) for i in range(core_start)] + [(i, p) for p in range(3) for i in range(core_start, num_layers)]
+    t_len, dim = 4, 16
+    x_init = torch.randn(t_len, dim, dtype=torch.bfloat16)
+    attn_qs = [torch.randn(1, dim) * (dim**-0.5) for _ in range(num_layers - 1)]
+    mlp_qs = [torch.randn(1, dim) * (dim**-0.5) for _ in range(num_layers)]
+    out_q = torch.randn(1, dim) * (dim**-0.5)
+    norm_1 = torch.ones(1, dim, dtype=torch.bfloat16)
+    msg_qs = [torch.randn(4, dim) * (dim**-0.5) for _ in range(num_layers - core_start)]
+    layer_ws = [torch.randn(dim, dim, dtype=torch.bfloat16) * 0.1 for _ in range(num_layers)]
+    md_p = types.SimpleNamespace(
+        is_prompt=True,
+        padding_mask_flat=torch.ones(t_len, dtype=torch.bool),
+        seq_lens_tensor=torch.tensor([t_len], dtype=torch.int32),
+        load_indices_tensor=torch.tensor([0], dtype=torch.int32),
+        store_indices_tensor=torch.tensor([1], dtype=torch.int32),
+        has_initial_states_p=None,
+    )
+    stream_sizes = (4, 4, dim, dim)
+    conv_dyn = [[torch.zeros(3, 3, sum(stream_sizes), dtype=torch.bfloat16) for _ in range(3)] for _ in range(num_layers)]
+    conv_sta = [[torch.zeros(3, 3, sum(stream_sizes), dtype=torch.bfloat16) for _ in range(3)] for _ in range(num_layers)]
+
+    # Dynamic-stack reference
+    blocks_ref: list[torch.Tensor] = []
+    comp_ref = x_init.new_empty((0, t_len, dim))
+    part_ref = x_init.clone()
+    in_ref = ops.rms_norm(part_ref, norm_1[0], 1e-6, torch.bfloat16).unsqueeze(0)
+    bank_ref = pre_comp_ref = pre_part_ref = pre_dest_ref = None
+    pre_blks_ref: list[torch.Tensor] | None = None
+    for v_i, (li, pi) in enumerate(visits):
+        looped = pi > 0
+        if li == core_start and not looped:
+            pre_blks_ref = list(blocks_ref)
+            pre_comp_ref = comp_ref
+            pre_part_ref = part_ref
+        elif li == core_start:
+            bank_ref = torch.stack([*blocks_ref[len(pre_blks_ref) + 1 :], part_ref], dim=0)
+            blocks_ref = list(pre_blks_ref)
+            comp_ref = pre_comp_ref
+            part_ref = pre_part_ref
+            if pre_dest_ref is None:
+                pre_dest_ref = ops.attn_res(comp_ref, pre_part_ref, None, attn_qs[li - 1], None, 0.0, True)
+            in_ref = pre_dest_ref
+        first = li % block_size_ar == 0
+        _, s_store, _, _, _ = sconv_mod.Inkling2HPUConvState.load_streams_from_buffers(
+            conv_dyn[li][pi], md_p.load_indices_tensor, md_p.store_indices_tensor, stream_sizes, md_p, batch_size=1
+        )
+        a_in = in_ref.to(torch.bfloat16)[0] if bank_ref is None or not looped else (in_ref[0] + ops.attn_res(bank_ref[:-1], bank_ref[-1], None, msg_qs[li - core_start], None, 0.0, True)[0]).to(torch.bfloat16)
+        a_out = torch.matmul(a_in, layer_ws[li])
+        all_b = (torch.cat([comp_ref, part_ref.unsqueeze(0)], dim=0) if comp_ref.shape[0] > 0 else part_ref.unsqueeze(0)) if first else comp_ref
+        m_in = ops.attn_res(all_b, a_out if first else part_ref, None if first else a_out, mlp_qs[li], norm_1, 1e-6, True)[0]
+        m_out = torch.matmul(m_in, layer_ws[li].t())
+        sconv_mod.Inkling2HPUConvState.store_streams_to_buffer(
+            conv_dyn[li][pi], s_store, (a_out[:1, :4].expand(1, 3, 4), a_out[:1, 4:8].expand(1, 3, 4), a_out[:1].expand(1, 3, dim), m_out[:1].expand(1, 3, dim))
+        )
+        new_p = (a_out.float() + m_out.float() if first else part_ref.float() + a_out.float() + m_out.float()).to(torch.bfloat16)
+        nq = out_q if v_i + 1 == len(visits) else attn_qs[visits[v_i + 1][0] - 1]
+        nw = norm_1 if (v_i + 1 == len(visits) or visits[v_i + 1][1] == 0) else None
+        in_ref = ops.attn_res(all_b, new_p, None, nq, nw, 1e-6 if nw is not None else 0.0, True)
+        if first:
+            blocks_ref.append(part_ref)
+            comp_ref = torch.stack(blocks_ref, dim=0)
+        part_ref = new_p
+
+    # Static-stack state machine
+    max_blks = (num_layers + block_size_ar - 1) // block_size_ar
+    comp_buf = x_init.new_zeros((max_blks, t_len, dim))
+    comp_val = torch.zeros((max_blks,), dtype=torch.bool)
+    zero_p = x_init.new_zeros((t_len, dim))
+    n_comp = 0
+    part_s = x_init.clone()
+    in_s = ops.rms_norm(part_s, norm_1[0], 1e-6, torch.bfloat16).unsqueeze(0)
+    bank_s = pre_part_s = pre_dest_s = None
+    pre_n = 0
+    for v_i, (li, pi) in enumerate(visits):
+        looped = pi > 0
+        if li == core_start and not looped:
+            pre_n = n_comp
+            pre_part_s = part_s
+        elif li == core_start:
+            bank_s = torch.cat([comp_buf[pre_n + 1 : n_comp], part_s.unsqueeze(0)], dim=0)
+            comp_buf[pre_n:].zero_()
+            comp_val.zero_()
+            comp_val[:pre_n] = True
+            n_comp = pre_n
+            part_s = pre_part_s
+            if pre_dest_s is None:
+                pre_dest_s = ops.attn_res(comp_buf, pre_part_s, None, attn_qs[li - 1], None, 0.0, True, stack_valid=comp_val)
+            in_s = pre_dest_s
+        if li % block_size_ar == 0:
+            comp_buf[n_comp].copy_(part_s)
+            comp_val[n_comp] = True
+            n_comp += 1
+            p_in = zero_p
+        else:
+            p_in = part_s
+        _, s_store, _, _, _ = sconv_mod.Inkling2HPUConvState.load_streams_from_buffers(
+            conv_sta[li][pi], md_p.load_indices_tensor, md_p.store_indices_tensor, stream_sizes, md_p, batch_size=1
+        )
+        a_in = in_s.to(torch.bfloat16)[0] if bank_s is None or not looped else (in_s[0] + ops.attn_res(bank_s[:-1], bank_s[-1], None, msg_qs[li - core_start], None, 0.0, True)[0]).to(torch.bfloat16)
+        a_out = torch.matmul(a_in, layer_ws[li])
+        m_in = ops.attn_res(comp_buf, p_in, a_out, mlp_qs[li], norm_1, 1e-6, True, stack_valid=comp_val)[0]
+        m_out = torch.matmul(m_in, layer_ws[li].t())
+        sconv_mod.Inkling2HPUConvState.store_streams_to_buffer(
+            conv_sta[li][pi], s_store, (a_out[:1, :4].expand(1, 3, 4), a_out[:1, 4:8].expand(1, 3, 4), a_out[:1].expand(1, 3, dim), m_out[:1].expand(1, 3, dim))
+        )
+        part_s = (p_in.float() + a_out.float() + m_out.float()).to(torch.bfloat16)
+        nq = out_q if v_i + 1 == len(visits) else attn_qs[visits[v_i + 1][0] - 1]
+        nw = norm_1 if (v_i + 1 == len(visits) or visits[v_i + 1][1] == 0) else None
+        in_s = ops.attn_res(comp_buf, part_s, None, nq, nw, 1e-6 if nw is not None else 0.0, True, stack_valid=comp_val)
+
+    assert torch.allclose(in_s[0].float(), in_ref[0].float(), atol=1e-3)
+    for li in range(num_layers):
+        for pi in range(3):
+            assert torch.allclose(conv_sta[li][pi].float(), conv_dyn[li][pi].float(), atol=1e-3)

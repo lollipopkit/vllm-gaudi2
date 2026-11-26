@@ -109,6 +109,90 @@ class Inkling2HPUConvState(nn.Module, AttentionLayerBase):
     def _state_buffer(self) -> torch.Tensor:
         return self.kv_cache[0] if isinstance(self.kv_cache, (list, tuple)) else self.kv_cache
 
+    def resolve_cache_refs(
+        self, attn_metadata
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Resolve `(state_buf, load_idx, store_idx)` outside `torch.compile` (zero per-pass guard)."""
+        state_buf = self._state_buffer()
+        if attn_metadata is None or state_buf.numel() == 0:
+            return state_buf, None, None
+        raw_load = getattr(attn_metadata, "load_indices_tensor", None)
+        raw_store = getattr(attn_metadata, "store_indices_tensor", None)
+        cg_int = getattr(self, "_cache_group_int", None)
+        if cg_int is None and self.cache_group_idx is not None:
+            cg_int = int(self.cache_group_idx.item())
+            object.__setattr__(self, "_cache_group_int", cg_int)
+        if cg_int is not None:
+            load_idx = raw_load[cg_int] if (raw_load is not None and raw_load.ndim > 1) else raw_load
+            store_idx = (
+                raw_store[cg_int] if (raw_store is not None and raw_store.ndim > 1) else raw_store
+            )
+        else:
+            load_idx = self._select_indices(raw_load)
+            store_idx = self._select_indices(raw_store)
+        return state_buf, load_idx, store_idx
+
+    @staticmethod
+    def load_streams_from_buffers(
+        state_buf: torch.Tensor,
+        load_idx: torch.Tensor | None,
+        store_idx: torch.Tensor | None,
+        stream_sizes: tuple[int, int, int, int],
+        attn_metadata,
+        batch_size: int = 1,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        torch.Tensor | None,
+        bool,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Pure-tensor conv stream loader that avoids any module/pass_idx Dynamo guards."""
+        if attn_metadata is None or state_buf.numel() == 0:
+            return None, None, True, None, None
+        num_slots = state_buf.shape[0]
+        idx_dtype = torch.int32 if state_buf.device.type == "hpu" else torch.long
+        if attn_metadata.is_prompt:
+            b = max(1, batch_size)
+            pad_mask = getattr(attn_metadata, "padding_mask_flat", None)
+            seq_lens = getattr(attn_metadata, "seq_lens_tensor", None)
+            if seq_lens is not None:
+                seq_lens = seq_lens.reshape(-1)[:b]
+            prev_streams = None
+            has_init = getattr(attn_metadata, "has_initial_states_p", None)
+            if load_idx is not None and has_init is not None:
+                safe_load = torch.remainder(load_idx.reshape(-1)[:b].to(idx_dtype), num_slots)
+                loaded = state_buf.index_select(0, safe_load)
+                init_mask = has_init.reshape(-1)[:b].bool().view(b, 1, 1)
+                loaded = torch.where(init_mask, loaded, torch.zeros_like(loaded))
+                prev_streams = loaded.split(stream_sizes, dim=-1)
+            safe_store = (
+                torch.remainder(store_idx.reshape(-1)[:b].to(idx_dtype), num_slots)
+                if store_idx is not None
+                else None
+            )
+            return prev_streams, safe_store, True, pad_mask, seq_lens
+
+        assert load_idx is not None
+        safe_load = torch.remainder(load_idx.reshape(-1).to(idx_dtype), num_slots)
+        safe_store = (
+            torch.remainder(store_idx.reshape(-1).to(idx_dtype), num_slots)
+            if store_idx is not None
+            else safe_load
+        )
+        prev_streams = state_buf.index_select(0, safe_load).split(stream_sizes, dim=-1)
+        return prev_streams, safe_store, False, None, None
+
+    @staticmethod
+    def store_streams_to_buffer(
+        state_buf: torch.Tensor,
+        safe_store: torch.Tensor | None,
+        parts: tuple[torch.Tensor, ...],
+    ) -> None:
+        if safe_store is None:
+            return
+        state_buf.index_copy_(0, index_copy_indices(safe_store), torch.cat(parts, dim=-1))
+
     def load_streams(
         self,
         attn_metadata,

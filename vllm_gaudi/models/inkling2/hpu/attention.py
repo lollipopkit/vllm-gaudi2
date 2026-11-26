@@ -604,6 +604,11 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
             vllm_config, self.num_kv_heads, self.head_dim, self.sliding_window
         )
 
+    def _get_kv_cache_only(self, pass_idx: int) -> list[torch.Tensor] | torch.Tensor:
+        if pass_idx == 0 or not self.pass_caches:
+            return self.kv_cache
+        return self.pass_caches[str(pass_idx - 1)].kv_cache
+
     def _pass_cache(self, pass_idx: int) -> tuple[str, list[torch.Tensor] | torch.Tensor]:
         if pass_idx == 0 or not self.pass_caches:
             return self.prefix, self.kv_cache
@@ -739,6 +744,7 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
         direct_conv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         x_f8: torch.Tensor | None = None,
         x_sc: torch.Tensor | None = None,
+        explicit_kv_cache: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.is_local and x_k is None:
             x_k = x_v = x_q
@@ -903,10 +909,16 @@ class Inkling2HPUAttention(nn.Module, AttentionLayerBase):
                 eps=self.eps,
             )
 
-        layer_name, kv_cache = self._pass_cache(pass_idx)
         attn_metadata = get_forward_context().attn_metadata
-        if isinstance(attn_metadata, dict):
+        if explicit_kv_cache is not None:
+            kv_cache = explicit_kv_cache
+            if isinstance(attn_metadata, dict):
+                attn_metadata = next(iter(attn_metadata.values()), None)
+        elif isinstance(attn_metadata, dict):
+            layer_name, kv_cache = self._pass_cache(pass_idx)
             attn_metadata = attn_metadata.get(layer_name)
+        else:
+            kv_cache = self._get_kv_cache_only(pass_idx)
 
         has_cache = (
             attn_metadata is not None

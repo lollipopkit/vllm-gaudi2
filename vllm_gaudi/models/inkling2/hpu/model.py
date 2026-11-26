@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import types
@@ -46,7 +47,13 @@ from .attention import (
     build_decode_attn_context,
 )
 from .moe import _MOE_TPC_MAX_TOKENS, Inkling2HPUMoE
-from .ops import attn_res, attn_res_f8, compute_log_scaling_tau, rms_norm
+from .ops import (
+    attn_res,
+    attn_res_f8,
+    compact_inkling2_hpu_buckets,
+    compute_log_scaling_tau,
+    rms_norm,
+)
 from .sconv import (
     ATTN_STREAM,
     MLP_STREAM,
@@ -217,6 +224,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
         direct_conv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         x_f8: torch.Tensor | None = None,
         x_sc: torch.Tensor | None = None,
+        explicit_kv_cache: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.is_local and len(inputs) == 1:
             return self.attn(
@@ -229,6 +237,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
                 direct_conv_cache=direct_conv_cache,
                 x_f8=None if x_f8 is None else x_f8[0],
                 x_sc=None if x_sc is None else x_sc[0],
+                explicit_kv_cache=explicit_kv_cache,
             )
         return self.attn(
             positions,
@@ -243,6 +252,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
             direct_conv_cache=direct_conv_cache,
             x_f8=x_f8,
             x_sc=x_sc,
+            explicit_kv_cache=explicit_kv_cache,
         )
 
     def forward(
@@ -266,6 +276,9 @@ class Inkling2HPUDecoderLayer(nn.Module):
         inputs_f8: torch.Tensor | None = None,
         inputs_sc: torch.Tensor | None = None,
         return_next_f8: bool = False,
+        completed_valid: torch.Tensor | None = None,
+        explicit_kv_cache: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        explicit_conv_cache: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None] | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]
@@ -278,45 +291,65 @@ class Inkling2HPUDecoderLayer(nn.Module):
         """
         from vllm.forward_context import get_forward_context
 
-        owner = self.conv_states[pass_idx]
         tp_size = get_tensor_model_parallel_world_size()
         attn_metadata = get_forward_context().attn_metadata
 
-        can_direct_conv = (
-            partial.device.type == "hpu"
-            and partial.dtype == torch.bfloat16
-            and tp_size == 1
-            and self.attn.head_dim == 128
-            and self.attn.d_rel <= 64
-            and self.attn.k_sconv.kernel_size == 4
-            and not self.attn_sconv.dynamic
-            and self.attn_sconv.kernel_size == 4
-            and not self.mlp_sconv.dynamic
-            and self.mlp_sconv.kernel_size == 4
-            and (owner.hidden_size % 64) == 0
-            and has_tpc_qkvr_prep()
-            and has_tpc_sconv()
-        )
-        direct_refs = (
-            owner.get_decode_cache_refs(attn_metadata, decode_ctx=decode_ctx)
-            if can_direct_conv
-            else None
-        )
-
-        if direct_refs is not None:
-            conv_state_buf, load_slots_i32, safe_store = direct_refs
-            prev_k = prev_v = prev_attn = prev_mlp = None
-            conv_is_prompt = False
-            pad_mask = seq_lens = None
-        else:
+        owner: Inkling2HPUConvState | None = None
+        if explicit_conv_cache is not None:
+            direct_refs = None
             conv_state_buf = load_slots_i32 = None
-            prev_streams, safe_store, conv_is_prompt, pad_mask, seq_lens = owner.load_streams(
-                attn_metadata, batch_size=batch_size, decode_ctx=decode_ctx
+            exp_state_buf, exp_load_idx, exp_store_idx = explicit_conv_cache
+            prev_streams, safe_store, conv_is_prompt, pad_mask, seq_lens = (
+                Inkling2HPUConvState.load_streams_from_buffers(
+                    exp_state_buf,
+                    exp_load_idx,
+                    exp_store_idx,
+                    self.conv_state.stream_sizes,
+                    attn_metadata,
+                    batch_size=batch_size,
+                )
             )
             prev_k = None if prev_streams is None else prev_streams[0]
             prev_v = None if prev_streams is None else prev_streams[1]
             prev_attn = None if prev_streams is None else prev_streams[2]
             prev_mlp = None if prev_streams is None else prev_streams[3]
+        else:
+            owner = self.conv_states[pass_idx]
+            can_direct_conv = (
+                partial.device.type == "hpu"
+                and partial.dtype == torch.bfloat16
+                and tp_size == 1
+                and self.attn.head_dim == 128
+                and self.attn.d_rel <= 64
+                and self.attn.k_sconv.kernel_size == 4
+                and not self.attn_sconv.dynamic
+                and self.attn_sconv.kernel_size == 4
+                and not self.mlp_sconv.dynamic
+                and self.mlp_sconv.kernel_size == 4
+                and (owner.hidden_size % 64) == 0
+                and has_tpc_qkvr_prep()
+                and has_tpc_sconv()
+            )
+            direct_refs = (
+                owner.get_decode_cache_refs(attn_metadata, decode_ctx=decode_ctx)
+                if can_direct_conv
+                else None
+            )
+
+            if direct_refs is not None:
+                conv_state_buf, load_slots_i32, safe_store = direct_refs
+                prev_k = prev_v = prev_attn = prev_mlp = None
+                conv_is_prompt = False
+                pad_mask = seq_lens = None
+            else:
+                conv_state_buf = load_slots_i32 = None
+                prev_streams, safe_store, conv_is_prompt, pad_mask, seq_lens = owner.load_streams(
+                    attn_metadata, batch_size=batch_size, decode_ctx=decode_ctx
+                )
+                prev_k = None if prev_streams is None else prev_streams[0]
+                prev_v = None if prev_streams is None else prev_streams[1]
+                prev_attn = None if prev_streams is None else prev_streams[2]
+                prev_mlp = None if prev_streams is None else prev_streams[3]
 
         messages: torch.Tensor | None = None
         attn_inputs: Sequence[torch.Tensor]
@@ -392,6 +425,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
                 kv_conv_state=(prev_k, prev_v, conv_is_prompt, pad_mask, seq_lens),
                 x_f8=attn_f8,
                 x_sc=attn_sc,
+                explicit_kv_cache=explicit_kv_cache,
             )
             assert isinstance(attn_res_tuple, tuple) and len(attn_res_tuple) == 3
             attn_partial, new_k_state, new_v_state = attn_res_tuple
@@ -412,10 +446,16 @@ class Inkling2HPUDecoderLayer(nn.Module):
                 if completed_blocks.shape[0] > 0
                 else partial.unsqueeze(0)
             )
+            all_valid = (
+                torch.cat([completed_valid, completed_valid.new_ones((1,))], dim=0)
+                if (completed_valid is not None and completed_blocks.shape[0] > 0)
+                else None
+            )
             mlp_last = attn_out
             mlp_addend = None
         else:
             all_blocks = completed_blocks
+            all_valid = completed_valid
             mlp_last = partial
             mlp_addend = attn_out
 
@@ -430,6 +470,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
                 None,
                 0.0,
                 self.normalize_values,
+                stack_valid=all_valid,
             )
             mlp_in, mlp_f8, mlp_sc = self.blend_f8(  # type: ignore[attr-defined]
                 slice(3, 4),
@@ -449,6 +490,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
                 self.mlp_norm.eps,
                 self.normalize_values,
                 fp8_max=self.mlp.experts.fp8_max,
+                stack_valid=all_valid,
             )
 
         mlp_x_in = mlp_in[0]
@@ -553,9 +595,14 @@ class Inkling2HPUDecoderLayer(nn.Module):
                     pad_mask=pad_mask,
                     seq_lens=seq_lens,
                 )
-                owner.store_streams(
-                    safe_store, (new_k_state, new_v_state, new_attn_state, new_mlp_state)
-                )
+                streams_to_store = (new_k_state, new_v_state, new_attn_state, new_mlp_state)
+                if explicit_conv_cache is not None:
+                    Inkling2HPUConvState.store_streams_to_buffer(
+                        explicit_conv_cache[0], safe_store, streams_to_store
+                    )
+                else:
+                    assert owner is not None
+                    owner.store_streams(safe_store, streams_to_store)
             if first:
                 new_partial = (attn_out.float() + mlp_out.float()).to(partial.dtype)
             else:
@@ -574,6 +621,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
                     next_norm_eps,
                     self.normalize_values,
                     fp8_max=self.attn.fp8_max,
+                    stack_valid=all_valid,
                 )
                 return new_partial, next_inputs, next_f8, next_sc
             next_inputs = attn_res(
@@ -584,6 +632,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
                 None,
                 next_norm_eps,
                 self.normalize_values,
+                stack_valid=all_valid,
             )
             return new_partial, next_inputs, None, None
 
@@ -595,6 +644,7 @@ class Inkling2HPUDecoderLayer(nn.Module):
             next_norm_weight,
             next_norm_eps,
             self.normalize_values,
+            stack_valid=all_valid,
         )
         return new_partial, next_inputs
 
@@ -622,16 +672,17 @@ class Inkling2HPUModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        # Split `forward` code objects by `(layer_cls, is_local)` (at most 4 variants instead of
-        # 24 per-layer code objects or 1 shared code object): keeps Python Dynamo compilation 6x
-        # faster than per-layer splitting while separating local vs full attention graphs cleanly.
-        variant_classes: dict[tuple[type, bool], type] = {}
-        for layer in self.layers:
+        # Split `forward` code objects by `(layer_cls, is_local, next_is_full)` (at most 6 variants)
+        # so layers with identical structure and `next_query` width share compiled graphs cleanly.
+        variant_classes: dict[tuple[type, bool, bool], type] = {}
+        num_layers = len(self.layers)
+        for idx, layer in enumerate(self.layers):
             base_cls = type(layer)
-            key = (base_cls, bool(layer.is_local))
+            next_is_full = idx + 1 < num_layers and not self.layers[idx + 1].is_local
+            key = (base_cls, bool(layer.is_local), bool(next_is_full))
             cls = variant_classes.get(key)
             if cls is None:
-                kind = "local" if layer.is_local else "full"
+                kind = ("local" if layer.is_local else "full") + ("_tofull" if next_is_full else "")
                 fwd = base_cls.forward
                 code = fwd.__code__.replace(co_name=f"{base_cls.__name__}_{kind}_forward")
                 new_fwd = types.FunctionType(
@@ -647,6 +698,31 @@ class Inkling2HPUModel(nn.Module):
         )
         self.attn_res = Inkling2HPUAttnRes(config)
         self.norm = Inkling2HPURMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    def optimize_hpu_buckets(
+        self,
+        prompt_buckets: list[tuple[int, int, int]],
+        decode_buckets: list[tuple[int, int, int]],
+        *,
+        max_model_len: int,
+        max_num_batched_tokens: int,
+        max_num_seqs: int,
+        block_size: int,
+        num_hpu_blocks: int | None,
+        use_contiguous_pa: bool = False,
+        use_merged_prefill: bool = False,
+    ) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+        return compact_inkling2_hpu_buckets(
+            prompt_buckets,
+            decode_buckets,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
+            block_size=block_size,
+            num_hpu_blocks=num_hpu_blocks,
+            use_contiguous_pa=use_contiguous_pa,
+            use_merged_prefill=use_merged_prefill,
+        )
 
     def _make_layer(
         self,
@@ -683,11 +759,61 @@ class Inkling2HPUModel(nn.Module):
         blocks: list[torch.Tensor] = []
         partial = inputs_embeds
         tau = self._log_scaling_tau(positions)
-        attn_md = get_forward_context().attn_metadata
-        if isinstance(attn_md, dict):
-            attn_md = next(iter(attn_md.values()), None)
+        raw_attn_md = get_forward_context().attn_metadata
+        attn_md = next(iter(raw_attn_md.values()), None) if isinstance(raw_attn_md, dict) else raw_attn_md
         is_decode = attn_md is not None and not getattr(attn_md, "is_prompt", True)
         decode_bs = num_tokens if is_decode else batch_size
+
+        if (
+            not is_decode
+            and not isinstance(raw_attn_md, dict)
+            and os.environ.get("INKLING2_STATIC_PREFILL_STACK", "1") != "0"
+            and num_layers > 0
+            and self.layers[0].conv_state._state_buffer().numel() > 0
+        ):
+            max_blocks = (num_layers + self.block_size - 1) // self.block_size
+            completed_buf = inputs_embeds.new_zeros((max_blocks, num_tokens, hidden))
+            completed_valid = torch.zeros((max_blocks,), dtype=torch.bool, device=inputs_embeds.device)
+            zero_partial = inputs_embeds.new_zeros((num_tokens, hidden))
+            num_completed = 0
+            inputs = torch.stack(
+                [self.layers[0].attn_norm(partial, j) for j in range(self.layers[0].num_attn_inputs)],
+                dim=0,
+            )
+            for i, layer in enumerate(self.layers):
+                if i % self.block_size == 0:
+                    completed_buf[num_completed].copy_(partial)
+                    completed_valid[num_completed] = True
+                    num_completed += 1
+                    partial_in = zero_partial
+                else:
+                    partial_in = partial
+                is_last = i + 1 >= num_layers
+                next_query = self.attn_res.output_query if is_last else self.attn_res.attn_queries[i]
+                next_norm = self.norm if is_last else self.layers[i + 1].attn_norm
+                kv_cache = layer.attn._get_kv_cache_only(0)
+                conv_refs = layer.conv_states[0].resolve_cache_refs(attn_md)
+                partial, inputs = layer(
+                    positions,
+                    completed_buf,
+                    partial_in,
+                    inputs,
+                    self.attn_res.mlp_queries[i],
+                    next_query,
+                    next_norm.weight,
+                    next_norm.eps,
+                    tau,
+                    first=False,
+                    pass_idx=0,
+                    batch_size=decode_bs,
+                    decode_ctx=None,
+                    completed_valid=completed_valid,
+                    explicit_kv_cache=kv_cache,
+                    explicit_conv_cache=conv_refs,
+                )
+            assert inputs is not None
+            return inputs[0]
+
         decode_ctx = build_decode_attn_context(
             attn_md,
             positions,

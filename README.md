@@ -10,7 +10,7 @@ Targets **Gaudi2 only** (not tested on Gaudi1 or Gaudi3). The Python package nam
 
 | Model | Precision | Performance | Quality / Key Optimizations |
 |---|---|---|---|
-| **Inkling 2 Mini** (26.4B Looped MoE + 23-layer ViT) | FP8 (`inkling2_fp8`) | Offline `133.4–133.5 tok/s` (`7.5 ms`, `c=1`) · `318.7` (`c=4`) · `487.6` (`c=8`) · `430.2–436.6` (`c=8` diverse); HTTP `127.8` (`c=1` greedy) / `126.7` (`c=1` `temp=1.0`) / `402.3` (`c=8` `temp=1.0`, `VLLM_FULL_WARMUP=1`) | `25.55 GiB` HBM, 17 custom TPC-C kernels (`2.87×` at `c=1`, `2.65×` at `c=8` vs. stock TPC), 6-layer decode groups, single-graph Gumbel sampler, native FP8→FP32 `lm_head` |
+| **Inkling 2 Mini** (26.4B Looped MoE + 23-layer ViT) | FP8 (`inkling2_fp8`) | Offline `133.4–133.5 tok/s` (`7.5 ms`, `c=1`) · `318.7` (`c=4`) · `487.6` (`c=8`) · `430.2–436.6` (`c=8` diverse); HTTP `127.8` (`c=1` greedy) / `126.7` (`c=1` `temp=1.0`) / `402.3` (`c=8` `temp=1.0`, `VLLM_FULL_WARMUP=1`) | `25.55 GiB` HBM, 17 custom TPC-C kernels (`2.87×` at `c=1`, `2.65×` at `c=8` vs. stock TPC), 6-layer decode groups, single-graph Gumbel sampler, native FP8→FP32 `lm_head`, `4.0×` faster warmup (`722 s` cold / `570 s` warm) |
 | **Qwen3.8-27B** (48 GDN + 16 GQA) | FP8 + FP8 KV | `65.1 tok/s` (`15.35 ms`, `b=1`) · `449.6` (`b=8`) · `1,185` (`b=32`) · `265–268` out / `2,443–2,467` total (`c=8`) · `298` out / `2,744` total (`c=32`, TTFT `4.34 s`) | GSM8K `95.3%`, NLL `+0.0000` vs stock TPC, custom GDN + fused FP8 TPC kernels (`-20%` warmup), FlashQLA prefill, MTP / DFlash2 |
 | **LiquidAI LFM3** (`1.7B` / `VL-2B` / `Omni-2B`) | FP8 (`e4m3fn`) | `198.3 tok/s` (`b=1` vendor) · `1,214.6` (`b=8`) · `1,636.0` (`b=32` vendor; `4,245` greedy) · serve `213.5` (`c=1`) / `1,323.5` (`c=8`) / `1,445–1,460` out (`c=32`, vendor) | GSM8K `76.7%`, MMStar `74.4%`, LibriSpeech WER `2.51%`, NLL `2.7795`, `G=12` decode groups, single-graph 64-group `_topk` sampler, packed vision tower |
 
@@ -32,7 +32,7 @@ Measured on the same single `HL-225` (`350 W` cap) with `vllm bench serve` (`204
 
 - **25 Custom Gaudi2 TPC-C Kernels ([`tpc/`](tpc/))**: `gdn_decode` / `gdn_verify` for Qwen3.8, 6 fused FP8 norm/SwiGLU, GDN prep/gated-norm, and LFM3 ShortConv kernels (`gaudi2_add_rms_norm_f8`, `gaudi2_sandwich_rms_norm_f8`, `gaudi2_silu_mul_f8`, `gdn_prep_decode`, `gdn_gated_rms_norm_f8`, `lfm3_short_conv_decode`), plus 17 Inkling2 decode kernels (MoE gate/grouping/FP8 GEMV, paged relative-bias attention, Block AttnRes, short-conv), bundled with stock `libtpc_kernels.so` inside single-file `libgaudi2_tpc_proxy.so` (preserves Synapse recipe cache), PyTorch C++ ops (`tpc/torch/`), and simulator test suites (`tpc/tests/`).
 - **Out-of-Tree Model Plugins (`vllm_gaudi/models/`)**: Full HPU backends for Inkling 2 Mini (`inkling2/`), LiquidAI LFM3 / VL / Omni (`lfm3*.py`), and DFlash2 (`qwen3_dflash2.py`), registered through vLLM plugin entry points and guarded runtime hooks (`vllm_gaudi/patches.py`).
-- **Decode, Sampling & Runtime Optimizations**: Multi-layer compiled decode groups (`layer_groups.py`, `loop.py`), single-graph compiled `HpuSampler` fast paths (64-group two-stage `_topk`, `[rows, cap]` Gumbel-max, finite max-centering), FlashQLA GDN prefill (`flashinfer_gaudi/`), zero-sync static-window `int32` chunked prefill, native FP8→FP32 `lm_head` (`VLLM_HPU_FP8_LM_HEAD=1`), `int32` paged-attention indices, symbolic `fp8_gemm_v2` meta shapes, and zero-redundant-DMA decode (`13 → 4` H2D DMAs/step).
+- **Decode, Sampling & Runtime Optimizations**: Multi-layer compiled decode groups (`layer_groups.py`, `loop.py`), single-graph compiled `HpuSampler` fast paths (64-group two-stage `_topk`, `[rows, cap]` Gumbel-max, finite max-centering), FlashQLA GDN prefill (`flashinfer_gaudi/`), zero-sync static-window `int32` chunked prefill, static-stack prefill & compact bucketing for Inkling2 (`4.0×` faster cold warmup, `17.6×` smaller recipe cache), native FP8→FP32 `lm_head` (`VLLM_HPU_FP8_LM_HEAD=1`), `int32` paged-attention indices, symbolic `fp8_gemm_v2` meta shapes, and zero-redundant-DMA decode (`13 → 4` H2D DMAs/step).
 - **Offline Weight Converter ([`tools/convert_inkling2_fp8.py`](tools/convert_inkling2_fp8.py))**: Streams Inkling 2 Mini NVFP4/MXFP8 routed experts to per-channel Gaudi2 FP8 (`max=240.0`).
 
 ## Installation
@@ -98,6 +98,9 @@ vllm serve /models/Inkling-2-Mini-FP8 --no-enable-prefix-caching --port 8002
 | `VLLM_HPU_LFM3_COMPILE_LAYER_GROUP_SIZE` | `1` | Static decode layer group size for LFM3 (recommended: `12`) |
 | `INKLING2_FP8_ATTN` | `1` | Quantize Inkling2 attention `qkvr` / `wo_ud` projections to FP8 at load time |
 | `INKLING2_COMPILE_GROUP_SIZE` | `6` | Static decode layer group size for Inkling2 (8 groups across 48 visits) |
+| `INKLING2_STATIC_PREFILL_STACK` | `1` | Fixed-capacity prefill Block AttnRes stack + explicit cache args (`42 → 11` Dynamo graphs/bucket) |
+| `INKLING2_COMPACT_BUCKETS` | `1` | Compact non-contiguous PA prompt/decode bucketing (`72 → 12` prompt, `43 → 19` decode at `8k`) |
+| `INKLING2_MOE_DENSE_CHUNK` | `512` | Token chunk size (`>=128`) for dense FP8 MoE prefill |
 | `INKLING2_MOE_PACK_STATE` | `0` | Optional 8-input TPC `conv_state` packing epilogue (`0` keeps async DMA overlap default) |
 | `VLLM_FULL_WARMUP` | `0` | Warm all buckets then disable Dynamo guard checks during decode |
 

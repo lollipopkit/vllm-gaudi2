@@ -8,6 +8,8 @@ entire MoE block is HPU-Graph and `torch.compile` compatible.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -32,7 +34,7 @@ from .tpc_ops import has_tpc_gate, has_tpc_gate_splitk, has_tpc_moe, has_tpc_moe
 #   M >= 8 reads all 128 experts once via 2D w13 GEMM + scatter 3D w2 BMM.
 _MOE_TPC_MAX_TOKENS = 16
 _MOE_DENSE_MIN_TOKENS = 8
-_MOE_DENSE_CHUNK = 128
+_MOE_DENSE_CHUNK = max(128, int(os.environ.get("INKLING2_MOE_DENSE_CHUNK", "512")))
 
 
 class Inkling2HPUGate(nn.Module):
@@ -436,8 +438,7 @@ class Inkling2HPUFP8Experts(nn.Module):
                 accumulate=False,
             )  # [E, n_w2_blks, M, 256]
             summed = (
-                down4.float()
-                .sum(dim=0)
+                down4.sum(dim=0, dtype=torch.float32)
                 .view(n_w2_blks, m, 64, 2, 2)
                 .permute(1, 0, 3, 2, 4)
                 .reshape(m, hidden)
